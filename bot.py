@@ -898,13 +898,31 @@ def binance_recent_move_pct(asset):
 
 
 def cancel_clob_order(order_id):
-    try:
-        resp = clob_client.cancel(order_id)
-        log.info(f"[MAKER] cancel {str(order_id)[:12]}: {str(resp)[:120]}")
-        return True
-    except Exception as e:
-        log.warning(f"[MAKER] cancel failed {str(order_id)[:12]}: {e}")
-        return False
+    # py-clob-client versions differ on the cancel method name/signature.
+    # Try the known variants in order until one works.
+    last_err = None
+    for attempt in (
+        lambda: clob_client.cancel(order_id=order_id),
+        lambda: clob_client.cancel(order_id),
+        lambda: clob_client.cancel_order(order_id),
+        lambda: clob_client.cancel_orders([order_id]),
+    ):
+        try:
+            resp = attempt()
+            log.info(f"[MAKER] cancel {str(order_id)[:12]}: {str(resp)[:120]}")
+            return True
+        except TypeError as e:
+            last_err = e  # wrong signature for this variant, try next
+            continue
+        except AttributeError as e:
+            last_err = e  # method name doesn't exist on this client, try next
+            continue
+        except Exception as e:
+            # A real API error (order already gone, etc.) - treat as handled.
+            log.warning(f"[MAKER] cancel {str(order_id)[:12]} api error: {e}")
+            return False
+    log.warning(f"[MAKER] cancel failed {str(order_id)[:12]}: no working cancel method ({last_err})")
+    return False
 
 
 def get_order_matched(order_id):
