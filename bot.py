@@ -566,11 +566,49 @@ def build_recent(n=12):
                    f"· {sl}s left · {mvs} {res}")
     return "\n".join(out)
 
+def build_trade_lines(since_ts, max_lines=60):
+    """Individual fills with fill_ts > since_ts: entry time (secs left), move, price,
+    size, result. Newest first. Capped so the message stays under Telegram limits."""
+    conn = sqlite3.connect(DB_PATH); c = conn.cursor()
+    c.execute("""SELECT fill_ts, asset, tf, outcome, secs_left, binance_move_window,
+                        price, size, won
+                 FROM fills WHERE fill_ts > ? ORDER BY fill_ts DESC LIMIT ?""",
+              (since_ts, max_lines + 1))
+    rows = c.fetchall()
+    c.execute("SELECT COUNT(*) FROM fills WHERE fill_ts > ?", (since_ts,))
+    total_new = c.fetchone()[0] or 0
+    conn.close()
+    if not rows:
+        return f"\n<b>Trades since last report:</b> none"
+    out = [f"\n<b>Trades since last report ({total_new})</b>",
+           "<i>asset · dir · secs-left · move · px · size · result</i>"]
+    for fts, a, tf, oc, sl, mv, pr, sz, won in rows[:max_lines]:
+        t = (datetime.fromtimestamp(fts, timezone.utc) - timedelta(hours=4)).strftime("%H:%M:%S")
+        arrow = "🔺" if oc == "UP" else "🔻"
+        res = "✅" if won == 1 else "❌" if won == 0 else "⏳"
+        mvs = f"{mv:+.3f}%" if mv is not None else "—"
+        out.append(f"{t} {ASSET_EMOJI.get(a,'')}{a}{tf} {arrow} {sl}s {mvs} "
+                   f"{pr*100:.0f}¢ {sz:g} {res}")
+    if total_new > max_lines:
+        out.append(f"…+{total_new - max_lines} more (see DB / /recent)")
+    return "\n".join(out)
+
+
 def report_worker():
+    last_report_ts = int(time.time())
     while True:
         time.sleep(REPORT_SECS)
         try:
-            tg(build_report())
+            summary = build_report()
+            trades = build_trade_lines(last_report_ts)
+            last_report_ts = int(time.time())
+            msg = summary + "\n" + trades
+            # Telegram hard-caps ~4096 chars; split if needed.
+            if len(msg) <= 3800:
+                tg(msg)
+            else:
+                tg(summary)
+                tg(trades)
         except Exception as e:
             log.error(f"[report] {e}")
 
