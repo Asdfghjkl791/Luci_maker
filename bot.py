@@ -341,7 +341,10 @@ def book_poller():
     while True:
         try:
             now_dt = datetime.now(timezone.utc)
-            # Prune stale windows so book_state stays ~14, not unbounded.
+            # Prune windows that are no longer current, so book_state reflects real
+            # state. NOTE: books are only fetched in the final BOOK_SECS before a
+            # close, so books_live is correctly 0 between closes and ~7-14 just
+            # before each close — that is expected, not a fault.
             active_keys = set()
             for tf in TIMEFRAMES:
                 ot, _ = get_window_times(tf)
