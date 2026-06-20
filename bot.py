@@ -544,6 +544,155 @@ def report_loop():
             log.error(f"[report] {e}")
 
 # ─── MAIN ────────────────────────────────────────────────────────────────────
+_tg_offset = None
+
+# His wallet — used only for the on-demand /markets pull (no continuous polling here;
+# the tracker does that. This is a one-shot fetch when you text /markets).
+TRADER_WALLET = os.environ.get(
+    "TRADER_WALLET", "0xf3ce251f9c4ae0f3940a9f32de5dd1a1d05b8bc6").strip().lower()
+import re as _re
+_SLUG_RE = _re.compile(r"^([a-z]+)-updown-(\d+)m-(\d+)$")
+
+def build_markets_live():
+    """One-shot pull of his recent fills from the public API, summarized by timeframe
+    and by market. Lighter than the tracker (no entry-move reconstruction, no full
+    history) — just 'which markets, 5m vs 15m, and when', on demand."""
+    try:
+        r = requests.get("https://data-api.polymarket.com/trades",
+                         params={"user": TRADER_WALLET, "limit": 500, "takerOnly": "false"},
+                         timeout=15)
+        data = r.json()
+    except Exception as e:
+        return f"🗺️ <b>HIS MARKETS</b>\nfetch failed: {e}"
+    if not isinstance(data, list):
+        return "🗺️ <b>HIS MARKETS</b>\nunexpected API response."
+    his = [rec for rec in data if str(rec.get("proxyWallet", "")).lower() == TRADER_WALLET]
+    # parse to (asset, tf, secs_left, usd)
+    rev = {"btc":"BTC","eth":"ETH","sol":"SOL","doge":"DOGE","bnb":"BNB","xrp":"XRP","hype":"HYPE"}
+    tf_agg = {}        # tf -> [n, usd, sum_secs_left, n_with_sl]
+    grid = {}          # (asset,tf) -> [n, usd, sum_sl, n_sl]
+    for rec in his:
+        slug = rec.get("eventSlug") or rec.get("slug") or ""
+        m = _SLUG_RE.match(slug)
+        if not m:
+            continue
+        asset = rev.get(m.group(1))
+        if not asset:
+            continue
+        tf = int(m.group(2)); wopen = int(m.group(3)); wclose = wopen + tf*60
+        try:
+            price = float(rec.get("price",0)); size = float(rec.get("size",0))
+            fts = int(rec.get("timestamp",0))
+        except (TypeError, ValueError):
+            continue
+        usd = price*size; sl = wclose - fts
+        ta = tf_agg.setdefault(tf, [0,0.0,0,0]); ta[0]+=1; ta[1]+=usd
+        if -5 <= sl <= 1000: ta[2]+=sl; ta[3]+=1
+        g = grid.setdefault((asset,tf), [0,0.0,0,0]); g[0]+=1; g[1]+=usd
+        if -5 <= sl <= 1000: g[2]+=sl; g[3]+=1
+    if not grid:
+        return "🗺️ <b>HIS MARKETS</b>\nno recent 5m/15m fills in the latest pull."
+    emoji = {"BTC":"🟠","ETH":"🔷","SOL":"🟣","DOGE":"🟡","BNB":"🟨","XRP":"⚪","HYPE":"🟢"}
+    L = ["🗺️ <b>HIS MARKETS — recent pull</b>", "<i>which markets · 5m vs 15m · when</i>", ""]
+    L.append("<b>By timeframe</b>")
+    for tf in sorted(tf_agg):
+        n,usd,ssl,nsl = tf_agg[tf]
+        sls = f"~{ssl/nsl:.0f}s left" if nsl else "—"
+        L.append(f"  <b>{tf}m</b>: {n} fills · ${usd:,.0f} · enter {sls}")
+    L.append("")
+    L.append("<b>By market</b> <i>(fills · vol · avg secs-left)</i>")
+    for (asset,tf), (n,usd,ssl,nsl) in sorted(grid.items(), key=lambda x:-x[1][1]):
+        sls = f"{ssl/nsl:.0f}s" if nsl else "—"
+        L.append(f"  {emoji.get(asset,'')}{asset} {tf}m: {n} · ${usd:,.0f} · {sls}")
+    L.append(f"\n<i>Note: seconds-left softened by settlement batching; read as pattern.</i>")
+    L.append(f"🕐 {est_str()}")
+    return "\n".join(L)
+
+def build_book_report():
+    """The execution-gap answer: in the buckets that were both LOCKED and had time
+    to act, what was the actual ask price, and was there depth at ≤99¢? This is what
+    decides whether the frontier edge is reachable or already priced out."""
+    # (label, secs_left lo/hi, |move| lo/hi) — the safe-AND-reachable zone
+    buckets = [
+        ("10-20s, 0.05-0.20%", 10, 20, 0.05, 0.20),
+        ("20-40s, ≥0.10%",     20, 40, 0.10, 99),
+        ("40-70s, ≥0.20%",     40, 70, 0.20, 99),
+    ]
+    conn = sqlite3.connect(DB_PATH); c = conn.cursor()
+    L = ["📕 <b>BOOK / EXECUTION CHECK</b>",
+         "<i>When locked & reachable — could you buy at 99¢?</i>", ""]
+    any_rows = False
+    for label, slo, shi, mlo, mhi in buckets:
+        c.execute("""SELECT COUNT(*),
+                            AVG(poly_ask), AVG(poly_mid), AVG(poly_depth99),
+                            AVG(CASE WHEN poly_ask <= 0.99 THEN 1.0 ELSE 0.0 END),
+                            AVG(CASE WHEN correct=1 THEN 1.0 ELSE 0.0 END)
+                     FROM samples
+                     WHERE settled_outcome IS NOT NULL AND poly_ask IS NOT NULL
+                       AND secs_left >= ? AND secs_left < ?
+                       AND ABS(binance_move) >= ? AND ABS(binance_move) < ?""",
+                  (slo, shi, mlo, mhi))
+        n, avg_ask, avg_mid, avg_depth, frac_buyable, hold = c.fetchone()
+        if not n:
+            L.append(f"<b>{label}</b>: no book samples yet")
+            continue
+        any_rows = True
+        L.append(f"<b>{label}</b> ({n} samples, hold {hold*100:.1f}%)")
+        L.append(f"  avg ask {avg_ask*100:.1f}¢ · mid {avg_mid*100:.1f}¢")
+        L.append(f"  buyable ≤99¢: {frac_buyable*100:.0f}% of the time")
+        L.append(f"  avg depth ≤99¢: {avg_depth:.0f} shares")
+        L.append("")
+    conn.close()
+    if not any_rows:
+        L.append("\nNot enough book samples in the safe zone yet — let it run.")
+    else:
+        L.append("<i>Read: if 'buyable ≤99¢' is high AND depth is real, the edge is")
+        L.append("reachable. If ask is already &gt;99¢ when locked, it's priced out.</i>")
+    return "\n".join(L)
+
+def command_worker():
+    global _tg_offset
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    while True:
+        try:
+            params = {"timeout": 20, "allowed_updates": ["message"]}
+            if _tg_offset:
+                params["offset"] = _tg_offset
+            res = requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates",
+                               params=params, timeout=25)
+            for upd in res.json().get("result", []):
+                _tg_offset = upd["update_id"] + 1
+                msg = upd.get("message", {})
+                if str(msg.get("chat", {}).get("id", "")) != str(TELEGRAM_CHAT_ID):
+                    continue
+                text = (msg.get("text", "") or "").strip().lower()
+                if text == "/book":
+                    tg(build_book_report())
+                elif text == "/markets":
+                    tg(build_markets_live())
+                elif text == "/frontier":
+                    # reuse the report body by triggering one immediately
+                    try:
+                        conn = sqlite3.connect(DB_PATH); c = conn.cursor()
+                        c.execute("SELECT COUNT(*) FROM samples WHERE settled_outcome IS NOT NULL")
+                        n = c.fetchone()[0]; conn.close()
+                        tg(f"Frontier report runs hourly. {n} settled samples so far. "
+                           f"(Use the latest hourly LOCK FRONTIER message.)")
+                    except Exception as e:
+                        tg(f"frontier: {e}")
+                elif text == "/status":
+                    conn = sqlite3.connect(DB_PATH); c = conn.cursor()
+                    c.execute("SELECT COUNT(*), SUM(CASE WHEN settled_outcome IS NOT NULL THEN 1 ELSE 0 END), "
+                              "SUM(CASE WHEN poly_ask IS NOT NULL THEN 1 ELSE 0 END) FROM samples")
+                    tot, settled, withbook = c.fetchone(); conn.close()
+                    tg(f"🧪 Probe status\nSamples: {tot or 0}\nSettled: {settled or 0}\n"
+                       f"With book: {withbook or 0}\n🕐 {est_str()}")
+        except Exception as e:
+            log.warning(f"[cmd] {e}")
+            time.sleep(3)
+
+
 def main():
     if not WEBSOCKET_AVAILABLE:
         log.error("websocket-client missing — feeds disabled.")
@@ -556,6 +705,7 @@ def main():
     threading.Thread(target=book_poller, daemon=True).start()
     threading.Thread(target=sampler_loop, daemon=True).start()
     threading.Thread(target=report_loop, daemon=True).start()
+    threading.Thread(target=command_worker, daemon=True).start()
 
     tg("🧪 <b>CERTAINTY PROBE v2 started</b> (measure-only — NO orders)\n\n"
        f"Watching {' '.join(ASSET_LIST)} · 5m+15m, 1 sample/sec, final {SAMPLE_WINDOW_SECS}s\n"
