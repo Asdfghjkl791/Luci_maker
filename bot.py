@@ -54,7 +54,7 @@ SAMPLE_INTERVAL    = float(os.environ.get("SAMPLE_INTERVAL", "1.0"))
 VOL_LOOKBACK_SECS  = int(os.environ.get("VOL_LOOKBACK_SECS", "30"))
 CAPTURE_BOOK       = os.environ.get("CAPTURE_BOOK", "true").lower() == "true"
 BOOK_SECS          = int(os.environ.get("BOOK_SECS", "75"))   # only fetch book inside final N sec
-BOOK_REFRESH       = float(os.environ.get("BOOK_REFRESH", "2.0"))  # book poll cadence per market
+BOOK_REFRESH       = float(os.environ.get("BOOK_REFRESH", "3.0"))  # book poll cadence per market (2 sides → a bit slower)
 REPORT_SECS        = int(os.environ.get("REPORT_SECS", "3600"))
 DB_PATH            = os.environ.get("PROBE_DB", "certainty_probe.db")
 
@@ -360,25 +360,30 @@ def book_poller():
                 if secs_left < 0 or secs_left > BOOK_SECS:
                     continue
                 for asset in ASSET_LIST:
-                    bp = prices_binance.get(asset)
-                    # favored side from current underlying vs window open
                     toks = resolve_tokens(asset, tf, ot)
                     if not toks:
                         continue
-                    # determine favored side using binance move since open
-                    ticks = _snap(asset)
-                    b_open = price_at(ticks, ot.timestamp())
-                    side = "UP"
-                    if b_open and bp:
-                        side = "UP" if (bp - b_open) >= 0 else "DOWN"
-                    token = toks[0] if side == "UP" else toks[1]
-                    ask, bid, mid, depth = fetch_book(token)
+                    # Fetch BOTH sides' books. Don't trust token ordering to tell us
+                    # which is Up vs Down — instead identify the market's FAVORITE by
+                    # observed price (the side trading higher). In a locked window the
+                    # favorite IS the winner, so its ask is the price you'd actually pay.
+                    up_tok, down_tok = toks[0], toks[1]
+                    a0, b0, m0, d0 = fetch_book(up_tok)
+                    a1, b1, m1, d1 = fetch_book(down_tok)
+                    mid0 = m0 if m0 is not None else (a0 or 0)
+                    mid1 = m1 if m1 is not None else (a1 or 0)
+                    if (mid0 or 0) <= 0 and (mid1 or 0) <= 0:
+                        continue
+                    if (mid0 or 0) >= (mid1 or 0):
+                        ask, bid, mid, depth, fav = a0, b0, m0, d0, "side0"
+                    else:
+                        ask, bid, mid, depth, fav = a1, b1, m1, d1, "side1"
                     if ask is None and bid is None:
                         continue
                     wk = wkey(asset, tf, ot)
                     with _book_lock:
                         book_state[wk] = {"ts": time.time(), "ask": ask, "bid": bid,
-                                          "mid": mid, "depth99": depth, "side": side}
+                                          "mid": mid, "depth99": depth, "side": fav}
             time.sleep(BOOK_REFRESH)
         except Exception as e:
             log.warning(f"[book_poller] {e}")
