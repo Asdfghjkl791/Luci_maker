@@ -203,7 +203,7 @@ def chainlink_worker(asset):
     symbol = CHAINLINK_SYMBOLS.get(asset)
     if not symbol:
         return
-    reconnect = float(os.environ.get("CL_RECONNECT_SECS", "1.0"))
+    reconnect = float(os.environ.get("CL_RECONNECT_SECS", "5.0"))
     while True:
         ws = None
         try:
@@ -228,6 +228,9 @@ def chainlink_worker(asset):
                     break
         except Exception as e:
             log.warning(f"[Chainlink] {asset} {e}")
+            # On rate-limit (429) handshake rejections, wait longer before retrying.
+            if "429" in str(e) or "Too Many Requests" in str(e):
+                time.sleep(20)
         finally:
             try: ws and ws.close()
             except Exception: pass
@@ -338,6 +341,16 @@ def book_poller():
     while True:
         try:
             now_dt = datetime.now(timezone.utc)
+            # Prune stale windows so book_state stays ~14, not unbounded.
+            active_keys = set()
+            for tf in TIMEFRAMES:
+                ot, _ = get_window_times(tf)
+                for asset in ASSET_LIST:
+                    active_keys.add(wkey(asset, tf, ot))
+            with _book_lock:
+                for k in list(book_state.keys()):
+                    if k not in active_keys:
+                        del book_state[k]
             for tf in TIMEFRAMES:
                 ot, ct = get_window_times(tf)
                 secs_left = (ct - now_dt).total_seconds()
