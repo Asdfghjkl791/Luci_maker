@@ -549,6 +549,42 @@ def build_report():
     L.append(f"\n🕐 {est_str()}")
     return "\n".join(L)
 
+def build_sizing_report():
+    """His clip sizes per asset — avg/median/max shares and dollars. Reveals where
+    he can deploy real size (deep books) vs where he can't (thin books). The size
+    distribution is effectively a map of each market's capacity for capital."""
+    conn = sqlite3.connect(DB_PATH); c = conn.cursor()
+    c.execute("""SELECT asset,
+                        COUNT(*), AVG(size), MAX(size),
+                        AVG(usd), MAX(usd), SUM(usd)
+                 FROM fills GROUP BY asset ORDER BY SUM(usd) DESC""")
+    rows = c.fetchall()
+    # median shares per asset (SQLite has no median; compute in python)
+    med = {}
+    for a, in [(r[0],) for r in rows]:
+        c.execute("SELECT size FROM fills WHERE asset=? ORDER BY size", (a,))
+        vals = [x[0] for x in c.fetchall()]
+        if vals:
+            n = len(vals)
+            med[a] = vals[n//2] if n % 2 else (vals[n//2-1]+vals[n//2])/2
+    conn.close()
+    if not rows:
+        return "📦 <b>HIS SIZING</b>\nNo fills captured yet."
+    L = ["📦 <b>HIS CLIP SIZES — capacity map</b>",
+         "<i>where he can deploy size = where the book is deep</i>", ""]
+    for a, n, avg_sh, max_sh, avg_usd, max_usd, sum_usd in rows:
+        em = ASSET_EMOJI.get(a, "")
+        m = med.get(a, 0)
+        L.append(f"{em}<b>{a}</b> ({n} fills · ${sum_usd:,.0f} total)")
+        L.append(f"  shares: avg {avg_sh:,.0f} · med {m:,.0f} · max {max_sh:,.0f}")
+        L.append(f"  dollars: avg ${avg_usd:,.0f} · max ${max_usd:,.0f}")
+        L.append("")
+    L.append("<i>Big max clips = deep book (can take real size). Small everywhere")
+    L.append("= thin book (size-capped). This is where capital can actually go.</i>")
+    L.append(f"\n🕐 {est_str()}")
+    return "\n".join(L)
+
+
 def build_markets_report():
     """Which markets he enters and when — both the 5m-vs-15m strategic split and
     the per-asset × per-timeframe grid. Timing is reliable for his early entries;
@@ -674,6 +710,8 @@ def command_worker():
                 text = (msg.get("text", "") or "").strip().lower()
                 if text == "/report":
                     tg(build_report())
+                elif text == "/sizing":
+                    tg(build_sizing_report())
                 elif text == "/markets":
                     tg(build_markets_report())
                 elif text == "/recent":
