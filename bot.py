@@ -950,21 +950,22 @@ PER_ASSET_FRONTIER = {
     "SOL":  [(20, 0.10), (40, 0.17), (70, 0.21), (120, 0.27)],
     "HYPE": [(20, 0.16), (40, 0.20), (70, 0.24), (120, 0.30)],
 }
-# 15-MINUTE gate. We do NOT have a reliable measured 15m frontier yet (his 15m
-# sample is thin and the few real points - e.g. HYPE15 +0.785% @116s - show 15m
-# needs MUCH bigger moves the earlier you are). So 15m uses the 5m per-asset
-# numbers as a FLOOR, scaled UP by time-left. Conservative on purpose; replace
-# with the probe's measured 15m surface when it has enough samples.
-#   0-20s: 1.0x   20-70s: 1.5x   70-180s: 2.0x   180s+: 3.0x  (of the 5m buzzer #)
+# 15-MINUTE gate. We do NOT have a measured 15m frontier yet, and the few real
+# points show 15m needs MUCH bigger moves than 5m (e.g. HYPE15 +0.785% @116s;
+# BNB15 -0.235% @227s). The earlier you are in a 15m window, the bigger the move
+# must be. We build 15m off each asset's 5m 40-70s threshold (a mid, not the tiny
+# buzzer number) and scale UP steeply with time-left. Conservative on purpose -
+# this should SKIP small moves like ETH -0.058% @40s. Replace with the probe's
+# measured 15m surface when it has enough samples.
 def _frontier_15m(asset, secs_left):
     bands = PER_ASSET_FRONTIER.get(asset, GLOBAL_FRONTIER)
-    base = bands[0][1]  # the asset's 0-20s (buzzer) 5m threshold
+    base = bands[2][1] if len(bands) >= 3 else bands[-1][1]
     if secs_left <= 20:
-        return base * 1.0
+        return base * 1.3
     if secs_left <= 70:
-        return base * 1.5
+        return base * 1.8
     if secs_left <= 180:
-        return base * 2.0
+        return base * 2.3
     return base * 3.0
 # Fallback table for any asset not listed above (mirrors the old global gate).
 GLOBAL_FRONTIER = [(3, 0.02), (40, 0.10), (70, 0.20), (120, 0.40)]
