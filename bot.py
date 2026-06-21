@@ -931,34 +931,70 @@ MAKER_MIN_ASK_CENTS      = float(os.environ.get("MAKER_MIN_ASK_CENTS", "96.0"))
 # placement instant); this guards the RESTING period.
 MAKER_BAILOUT_CENTS      = float(os.environ.get("MAKER_BAILOUT_CENTS", "96.0"))
 
-# ── VARIANT: frontier gate thresholds (move %, by seconds-left band) ─────────
-# From 323k settled samples: the move needed to clear ~99% hold RISES the
-# earlier you enter. Below these, the outcome isn't locked - it's a coin flip.
-FRONTIER_BANDS = [
-    # (max_secs_left, min_abs_move_pct)
-    (3,    0.02),
-    (40,   0.10),
-    (70,   0.20),
-    (120,  0.40),
-]
+# ── VARIANT: PER-ASSET frontier gate (move %, by seconds-left band) ──────────
+# Each asset has its OWN move-threshold curve that rises as time-left grows.
+# Derived from the profitable wallet's actual entries per market. Volatile
+# assets (SOL/HYPE) sit higher; calm liquid ones (BTC) sit lower. These are a
+# starting surface from his behaviour - refine later with the probe's settled
+# per-asset frontier (which also captures where the line BREAKS, not just his
+# safe entries).
+#
+# Each row: (max_secs_left, min_abs_move_pct). First band whose max_secs covers
+# the current time-left wins. Bands must be in ascending max_secs order.
+PER_ASSET_FRONTIER = {
+    "BTC":  [(20, 0.025), (40, 0.04), (70, 0.08), (120, 0.15)],
+    "ETH":  [(20, 0.03), (40, 0.07), (70, 0.11), (120, 0.16)],
+    "XRP":  [(20, 0.04), (40, 0.10), (70, 0.15), (120, 0.23)],
+    "DOGE": [(20, 0.05), (40, 0.10), (70, 0.15), (120, 0.22)],
+    "BNB":  [(20, 0.04), (40, 0.10), (70, 0.17), (120, 0.20)],
+    "SOL":  [(20, 0.10), (40, 0.17), (70, 0.21), (120, 0.27)],
+    "HYPE": [(20, 0.16), (40, 0.20), (70, 0.24), (120, 0.30)],
+}
+# 15-MINUTE gate. We do NOT have a reliable measured 15m frontier yet (his 15m
+# sample is thin and the few real points - e.g. HYPE15 +0.785% @116s - show 15m
+# needs MUCH bigger moves the earlier you are). So 15m uses the 5m per-asset
+# numbers as a FLOOR, scaled UP by time-left. Conservative on purpose; replace
+# with the probe's measured 15m surface when it has enough samples.
+#   0-20s: 1.0x   20-70s: 1.5x   70-180s: 2.0x   180s+: 3.0x  (of the 5m buzzer #)
+def _frontier_15m(asset, secs_left):
+    bands = PER_ASSET_FRONTIER.get(asset, GLOBAL_FRONTIER)
+    base = bands[0][1]  # the asset's 0-20s (buzzer) 5m threshold
+    if secs_left <= 20:
+        return base * 1.0
+    if secs_left <= 70:
+        return base * 1.5
+    if secs_left <= 180:
+        return base * 2.0
+    return base * 3.0
+# Fallback table for any asset not listed above (mirrors the old global gate).
+GLOBAL_FRONTIER = [(3, 0.02), (40, 0.10), (70, 0.20), (120, 0.40)]
 FRONTIER_FALLBACK_PCT = float(os.environ.get("FRONTIER_FALLBACK_PCT", "0.40"))
-# HYPE floor: never enter HYPE on a move smaller than this, at ANY time-left.
-# HYPE settles on Chainlink spot but we signal on Binance futures; only large
-# moves overwhelm the basis. The wallet's own HYPE entries are all >=0.20%.
-HYPE_MIN_MOVE_PCT        = float(os.environ.get("HYPE_MIN_MOVE_PCT", "0.20"))
+# Optional hard floor for HYPE on top of its table (belt-and-suspenders).
+HYPE_MIN_MOVE_PCT     = float(os.environ.get("HYPE_MIN_MOVE_PCT", "0.16"))
+
+# ── VARIANT: stacking ────────────────────────────────────────────────────────
+# Re-enter the SAME window multiple times while the move stays above threshold
+# for the time remaining (mirrors the wallet's avg 3.2 fills/window). Each clip
+# is a fresh resting bid. Capped to bound exposure: STACK_MAX clips x $bet.
+STACK_MAX        = int(os.environ.get("STACK_MAX", "3"))
+STACK_GAP_SECS   = float(os.environ.get("STACK_GAP_SECS", "12"))
 
 
-def frontier_locked(asset, abs_move_pct, secs_left):
-    """Return True if (move, time-left) clears the lock frontier for this asset."""
+def frontier_locked(asset, abs_move_pct, secs_left, tf=5):
+    """True if (move, time-left) clears THIS asset's lock frontier for this
+    timeframe. 5m uses the measured per-asset table; 15m uses the conservative
+    time-scaled rule (see _frontier_15m)."""
     if secs_left <= 0:
         return False
-    # Find the threshold for the current time-left band.
-    need = FRONTIER_FALLBACK_PCT
-    for max_secs, min_move in FRONTIER_BANDS:
-        if secs_left <= max_secs:
-            need = min_move
-            break
-    # HYPE is held to a stricter floor regardless of time-left.
+    if tf == 15:
+        need = _frontier_15m(asset, secs_left)
+    else:
+        bands = PER_ASSET_FRONTIER.get(asset, GLOBAL_FRONTIER)
+        need = FRONTIER_FALLBACK_PCT
+        for max_secs, min_move in bands:
+            if secs_left <= max_secs:
+                need = min_move
+                break
     if asset == "HYPE":
         need = max(need, HYPE_MIN_MOVE_PCT)
     return abs_move_pct >= need
@@ -1179,11 +1215,7 @@ def _finalize_maker(info, reason):
             w["trade_db_id"] = db_id
             state["balance_usd"] -= cost
             state["trades_today"] += 1
-            tg(
-                f"🟢 <b>FILLED (maker) · {emoji} {asset} {tf}m {dirn}</b>\n\n"
-                f"📦 {matched:g}/{info['shares']:g} sh @ {avg_price*100:.1f}¢ = ${cost:.2f}\n"
-                f"🪧 Closed: {reason}\n🕐 {est_str()}"
-            )
+            tg(f"🟢 {emoji}{asset} {tf}m {dirn} · {matched:g}sh@{avg_price*100:.1f}¢ · ${cost:.2f}")
             # If the window already rolled over, schedule settlement ourselves
             # (settle() has a guard so it can't run twice for the same window).
             if datetime.now(timezone.utc) >= info["close_time"]:
@@ -1617,8 +1649,18 @@ def process_tick():
             absp = abs(pct)
             dirn = "UP" if pct >= 0 else "DOWN"
 
-            if w["traded"] or w["skipped"]:
+            if w["skipped"]:
                 continue
+            # ── STACKING ──
+            # Once the window has an entry, allow MORE clips into it while the
+            # move still clears the gate, spaced by STACK_GAP_SECS, up to
+            # STACK_MAX. This re-enters as certainty holds (the wallet's stacking).
+            if w["traded"]:
+                if w.get("stacks", 1) >= STACK_MAX:
+                    continue
+                if time.time() - w.get("last_stack_at", 0) < STACK_GAP_SECS:
+                    continue
+                # else fall through and re-check the gate for another clip
 
             # Per-asset-per-tf entry window (ETH/BNB/SOL/HYPE 5m can be tuned)
             entry_window = CONFIG["entry_window_seconds"]
@@ -1642,7 +1684,7 @@ def process_tick():
             # it settles on Chainlink spot while we signal on Binance futures, so
             # only large moves overwhelm the basis noise (matches how the
             # profitable wallet trades HYPE: his entries are all 0.20%+).
-            if not frontier_locked(asset, absp, secs_left):
+            if not frontier_locked(asset, absp, secs_left, tf):
                 continue
             if state["paused"]:
                 continue
@@ -1805,14 +1847,12 @@ def enter_trade(w, asset, tf, price, pct, dirn, secs_left, open_time, close_time
             w["entry_move"] = pct
             w["entry_revs"] = revs
             w["entry_recent_revs"] = recent_revs
+            w["stacks"] = w.get("stacks", 0) + 1
+            w["last_stack_at"] = time.time()
             active_directions[(asset, tf)] = dirn
-            tg(
-                f"🪧 <b>RESTING BID · {emoji} {asset} · {tf}m · {dirn}</b> {arrow}\n\n"
-                f"📈 Move: {pct:+.3f}%\n"
-                f"💵 {result['shares']:g} sh @ <b>{MAKER_BID_CENTS:.0f}¢</b> (${bet:.2f})\n"
-                f"⏱ {secs_left}s left · auto-cancel on Binance reversal\n"
-                f"🕐 {est_str()}"
-            )
+            sx = f" ×{w['stacks']}" if w["stacks"] > 1 else ""
+            tg(f"🪧 {emoji}{asset} {tf}m {dirn}{arrow}{sx} · {pct:+.3f}% · "
+               f"{result['shares']:g}sh@99¢ · {secs_left}s")
         else:
             # Failed (market not found, stale feed, rejected) - allow retry next cycle
             log.warning(f"[MAKER] place failed (will retry): {result.get('error')}")
@@ -2244,37 +2284,12 @@ def _settle_worker(d, asset, tf):
         del open_positions[d["trade_db_id"]]
 
     total, wins, total_pnl = db_stats()
-    wr = f"{wins/total*100:.1f}%" if total > 0 else "—"
+    wr = f"{wins/total*100:.0f}%" if total > 0 else "—"
     emoji = ASSET_EMOJI.get(asset, "")
     out_emoji = "✅" if won else "❌"
 
-    # Entry conditions captured at trade time (for reviewing what wins/losses looked like)
-    cond_lines = ""
-    if d.get("entry_move") is not None:
-        vol_str = ""
-        vs = d.get("entry_vol_stats")
-        if vs:
-            vol_str = (
-                f"🌊 Net: {vs['net']:+.3f}% · Avg: {vs['avg']:.4f}\n"
-                f"🌊 RealizedVol: {vs['rv']:.4f} · BigJumps: {vs['big']}\n"
-            )
-        elif d.get("entry_volatility") is not None:
-            vol_str = f"🌊 Volatility: {d['entry_volatility']:.4f}%/s\n"
-        cond_lines = (
-            f"📈 Move: {d['entry_move']:+.3f}%\n"
-            f"🔄 Window rev: {d.get('entry_revs','?')} · 30s rev: {d.get('entry_recent_revs','?')}\n"
-            f"{vol_str}"
-            f"💲 Entry: {entry_c:.1f}¢\n"
-        )
-
-    tg(
-        f"{out_emoji} <b>{emoji} {asset} {tf}m · {result}</b>\n\n"
-        f"Called: {d['direction']} · Actual: {actual}\n"
-        f"{cond_lines}"
-        f"<i>Source: {source}</i>\n"
-        f"PnL: <b>${pl:+.3f}</b> · Bal: ${state['balance_usd']:.2f}\n"
-        f"📊 {total} · {wr} · ${total_pnl:+.2f}"
-    )
+    tg(f"{out_emoji} {emoji}{asset} {tf}m {d['direction']} · ${pl:+.3f} · "
+       f"bal ${state['balance_usd']:.2f} · {total}·{wr}")
 
     # Auto-pause after consecutive losses
     if not won and state["consecutive_losses"] >= CONFIG["consecutive_loss_limit"]:
@@ -2310,13 +2325,12 @@ def main():
         f"🪧 MAKER - resting {MAKER_BID_CENTS:.0f}¢ bids" if maker_ok else "🤖 TAKER - FAK orders")
 
     tg(
-        f"🧪 <b>PolySniper VARIANT (frontier gate)</b>\n"
+        f"🧪 <b>PolySniper VARIANT (per-asset gate)</b>\n"
         f"{mode_str}\n"
-        f"🎯 <b>FRONTIER-GATED ENTRY</b>\n\n"
-        f"Gate (move ≥ X for time-left):\n"
-        f"  0-3s ≥0.02% · 3-40s ≥0.10%\n"
-        f"  40-70s ≥0.20% · 70-120s ≥0.40%\n"
-        f"  HYPE ≥{HYPE_MIN_MOVE_PCT:.2f}% (any time)\n"
+        f"🎯 <b>PER-MARKET FRONTIER ENTRY</b>\n\n"
+        f"Each asset has its own move×time gate:\n"
+        f"  BTC lowest · HYPE/SOL highest\n"
+        f"  (calm liquid = low bar, volatile = high bar)\n"
         f"🛟 Bail-out: cancel if filling < {MAKER_BAILOUT_CENTS:.0f}¢\n"
         f"💵 Bet: ${CONFIG['bet_size_day']:g} flat\n"
         f"💲 Ask floor: {MAKER_MIN_ASK_CENTS:.0f}¢\n"
