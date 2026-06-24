@@ -613,6 +613,54 @@ def build_markets_live():
     L.append(f"🕐 {est_str()}")
     return "\n".join(L)
 
+def build_grid_report(asset):
+    """Per-ASSET lock frontier, split by timeframe (5m and 15m) and time-left band.
+    This is the measured per-market-per-timeframe surface (replaces guessed
+    thresholds). Shows hold% and sample count per move bucket; the 'locks ≥X'
+    line is the smallest move that holds >=99% in that band."""
+    if asset not in ASSET_LIST:
+        return f"Unknown asset '{asset}'. Try one of: {', '.join(ASSET_LIST)}"
+    bands = [(0,3),(3,6),(6,10),(10,20),(20,40),(40,70),(70,120),(120,99999)]
+    buckets = [(0.0,0.02),(0.02,0.05),(0.05,0.10),(0.10,0.20),(0.20,0.40),(0.40,99)]
+    conn = sqlite3.connect(DB_PATH); c = conn.cursor()
+    em = ASSET_EMOJI.get(asset, "")
+    out = [f"📐 <b>{em} {asset} — frontier by timeframe</b>",
+           "<i>hold% per move×time; locks = smallest move ≥99%</i>"]
+    for tf in (5, 15):
+        out.append(f"\n<b>━━ {asset} {tf}m ━━</b>")
+        any_rows = False
+        for blo, bhi in bands:
+            cells = []
+            lock_thr = None
+            for mlo, mhi in buckets:
+                rows = c.execute(
+                    """SELECT correct FROM samples
+                       WHERE settled_outcome IS NOT NULL AND asset=? AND tf=?
+                         AND secs_left>=? AND secs_left<?
+                         AND ABS(binance_move)>=? AND ABS(binance_move)<?""",
+                    (asset, tf, blo, bhi, mlo, mhi)).fetchall()
+                n = len(rows)
+                if n == 0:
+                    continue
+                any_rows = True
+                hold = sum(r[0] for r in rows)/n*100
+                cells.append(f"{mlo:.2f}-{mhi:.2f}:{hold:.0f}%({n})")
+                if lock_thr is None and hold >= 99 and n >= 20:
+                    lock_thr = mlo
+            if cells:
+                label = f"{blo}-{bhi}s" if bhi < 99999 else f"{blo}s+"
+                out.append(f" {label}: " + " · ".join(cells))
+                if lock_thr is not None:
+                    out.append(f"   ✅ locks ≥{lock_thr:.2f}%")
+                else:
+                    out.append(f"   ⚠️ nothing holds ≥99% (need bigger move/less time)")
+        if not any_rows:
+            out.append(" (no settled samples yet for this timeframe)")
+    conn.close()
+    out.append(f"\n🕐 {est_str()}")
+    return "\n".join(out)
+
+
 def build_split_report():
     """THE KEY TEST: at the marginal zones where the bot loses, do LOSING windows
     have higher volatility / more flips than WINNING ones? If yes, a choppiness
@@ -735,6 +783,10 @@ def command_worker():
                     tg(build_book_report())
                 elif text == "/split":
                     tg(build_split_report())
+                elif text.startswith("/grid"):
+                    parts = text.split()
+                    asset = parts[1].upper() if len(parts) > 1 else "BTC"
+                    tg(build_grid_report(asset))
                 elif text == "/markets":
                     tg(build_markets_live())
                 elif text == "/frontier":
