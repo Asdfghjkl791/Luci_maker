@@ -638,8 +638,29 @@ def build_calm_report(asset):
     ]
     em = ASSET_EMOJI.get(asset, "")
     conn = sqlite3.connect(DB_PATH); c = conn.cursor()
+    # Diagnostic: how many settled rows actually have the calm columns populated?
+    diag = c.execute(
+        """SELECT
+             SUM(CASE WHEN settled_outcome IS NOT NULL THEN 1 ELSE 0 END),
+             SUM(CASE WHEN settled_outcome IS NOT NULL AND realized_vol IS NOT NULL THEN 1 ELSE 0 END),
+             SUM(CASE WHEN settled_outcome IS NOT NULL AND flip_count IS NOT NULL THEN 1 ELSE 0 END),
+             AVG(CASE WHEN settled_outcome IS NOT NULL THEN realized_vol END)
+           FROM samples WHERE asset=?""", (asset,)).fetchone()
+    n_settled = diag[0] or 0
+    n_rv = diag[1] or 0
+    n_fc = diag[2] or 0
+    avg_rv = diag[3]
     out = [f"🧘 <b>{em} {asset} — WIN% by market calm</b>",
-           "<i>does calmer = higher win%? (rv = jumpiness)</i>"]
+           "<i>does calmer = higher win%? (rv = jumpiness)</i>",
+           f"<i>settled:{n_settled} · w/ vol:{n_rv} · w/ flips:{n_fc}"
+           + (f" · avg rv:{avg_rv:.4f}" if avg_rv is not None else "") + "</i>"]
+    if n_rv == 0 and n_fc == 0:
+        out.append("\n⚠️ The calm columns (realized_vol, flip_count) are empty for")
+        out.append("settled rows — this data was gathered before they were recorded.")
+        out.append("Calm data will accumulate from now on; re-run /calm in a day.")
+        out.append(f"\n🕐 {est_str()}")
+        conn.close()
+        return "\n".join(out)
     for tf in (5, 15):
         out.append(f"\n<b>━━ {asset} {tf}m · by volatility ━━</b>")
         for label, lo, hi in vol_buckets:
