@@ -613,6 +613,67 @@ def build_markets_live():
     L.append(f"🕐 {est_str()}")
     return "\n".join(L)
 
+def build_calm_report(asset):
+    """THE CALM TEST: per asset per timeframe, split settled windows by how CALM
+    the market was (realized_vol = avg jumpiness, and flip_count) and show WIN%
+    in each calm bucket. If win% climbs as conditions get calmer, calm predicts
+    winning -> a calm filter helps, and the buckets tell you where to draw the
+    line (trade buckets >=99%, skip the rest). Runs on existing data."""
+    if asset not in ASSET_LIST:
+        return f"Unknown asset '{asset}'. Try: {', '.join(ASSET_LIST)}"
+    # Calm buckets by realized_vol (lower = calmer). Edges chosen to spread the
+    # mass; the report shows counts so you can see if a bucket is too thin.
+    vol_buckets = [
+        ("very calm  (rv<0.02)",  0.0,   0.02),
+        ("calm       (0.02-0.04)",0.02,  0.04),
+        ("moderate   (0.04-0.07)",0.04,  0.07),
+        ("choppy     (0.07-0.12)",0.07,  0.12),
+        ("very choppy(rv>0.12)",  0.12,  9.99),
+    ]
+    flip_buckets = [
+        ("steady (<=4 flips)",   0,  5),
+        ("some   (5-9 flips)",   5,  10),
+        ("choppy (10-15 flips)", 10, 16),
+        ("wild   (16+ flips)",   16, 9999),
+    ]
+    em = ASSET_EMOJI.get(asset, "")
+    conn = sqlite3.connect(DB_PATH); c = conn.cursor()
+    out = [f"🧘 <b>{em} {asset} — WIN% by market calm</b>",
+           "<i>does calmer = higher win%? (rv = jumpiness)</i>"]
+    for tf in (5, 15):
+        out.append(f"\n<b>━━ {asset} {tf}m · by volatility ━━</b>")
+        for label, lo, hi in vol_buckets:
+            rows = c.execute(
+                """SELECT correct FROM samples
+                   WHERE settled_outcome IS NOT NULL AND asset=? AND tf=?
+                     AND realized_vol >= ? AND realized_vol < ?""",
+                (asset, tf, lo, hi)).fetchall()
+            n = len(rows)
+            if n == 0:
+                continue
+            win = sum(r[0] for r in rows) / n * 100
+            flag = "✅" if win >= 99 else ("·" if win >= 97 else "⚠️")
+            out.append(f" {flag} {label}: {win:.1f}% ({n})")
+        out.append(f"<b>━━ {asset} {tf}m · by flips ━━</b>")
+        for label, lo, hi in flip_buckets:
+            rows = c.execute(
+                """SELECT correct FROM samples
+                   WHERE settled_outcome IS NOT NULL AND asset=? AND tf=?
+                     AND flip_count >= ? AND flip_count < ?""",
+                (asset, tf, lo, hi)).fetchall()
+            n = len(rows)
+            if n == 0:
+                continue
+            win = sum(r[0] for r in rows) / n * 100
+            flag = "✅" if win >= 99 else ("·" if win >= 97 else "⚠️")
+            out.append(f" {flag} {label}: {win:.1f}% ({n})")
+    conn.close()
+    out.append("\n<i>✅ = beats 99¢ · ⚠️ = loses money. If the ✅s cluster in the")
+    out.append("calm/steady rows, gate the bot to only trade those conditions.</i>")
+    out.append(f"\n🕐 {est_str()}")
+    return "\n".join(out)
+
+
 def build_grid_report(asset):
     """Per-ASSET lock frontier, split by timeframe (5m and 15m) and time-left band.
     This is the measured per-market-per-timeframe surface (replaces guessed
@@ -787,6 +848,10 @@ def command_worker():
                     parts = text.split()
                     asset = parts[1].upper() if len(parts) > 1 else "BTC"
                     tg(build_grid_report(asset))
+                elif text.startswith("/calm"):
+                    parts = text.split()
+                    asset = parts[1].upper() if len(parts) > 1 else "BTC"
+                    tg(build_calm_report(asset))
                 elif text == "/markets":
                     tg(build_markets_live())
                 elif text == "/frontier":
