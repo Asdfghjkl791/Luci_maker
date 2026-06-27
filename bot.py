@@ -1412,6 +1412,27 @@ def measure_vol_stats(hist, seconds=30, big_jump_pct=0.02):
     return stats
 
 
+def measure_move_hold(hist, open_price, seconds=60):
+    """MOVE-HOLD instability over the last N seconds (the metric we measure in the
+    probe). Looks at the move-from-open — (price - open) — each second and measures
+    how much that sequence DECAYS (slides toward zero) or SWINGS (bounces). Low =
+    the move held steady (good); high = decaying/swinging (bad). In % of price.
+    Returns None if not enough history or no open price."""
+    if not open_price or open_price <= 0:
+        return None
+    if len(hist) < 3:
+        return None
+    recent = list(hist)[-seconds:]
+    if len(recent) < 3:
+        return None
+    diffs = [(p - open_price) / open_price * 100.0 for p in recent if p > 0]
+    if len(diffs) < 3:
+        return None
+    level = diffs[-1]  # where the move currently sits
+    mad = sum(abs(d - level) for d in diffs) / len(diffs)
+    return round(mad, 4)
+
+
 def check_momentum(hist, direction, n):
     if len(hist) < n + 1:
         return True
@@ -1808,9 +1829,11 @@ def process_tick():
 
             # Log the reversal counts for entered trades (for tuning the choppy threshold)
             vol_stats = measure_vol_stats(hist, seconds=30)
-            log.info(f"ENTER {asset} {tf}m {dirn} - window_revs={revs}/{max_revs}, 30s_revs={recent_revs}/{CONFIG['choppy_threshold']}, move={pct:+.3f}%, net={vol_stats['net']:+.4f}% avg={vol_stats['avg']:.4f} rv={vol_stats['rv']:.4f} big={vol_stats['big']}")
+            move_hold = measure_move_hold(hist, w["open_price"], seconds=60)
+            log.info(f"ENTER {asset} {tf}m {dirn} - window_revs={revs}/{max_revs}, 30s_revs={recent_revs}/{CONFIG['choppy_threshold']}, move={pct:+.3f}%, hold={move_hold}, net={vol_stats['net']:+.4f}% avg={vol_stats['avg']:.4f} rv={vol_stats['rv']:.4f} big={vol_stats['big']}")
             w["entry_volatility"] = volatility
             w["entry_vol_stats"] = vol_stats
+            w["entry_hold"] = move_hold
             enter_trade(w, asset, tf, price, pct, dirn, secs_left, open_time, close_time, revs, recent_revs)
 
 
@@ -2208,6 +2231,8 @@ def settle(w, asset, tf, close_price):
         "entry_recent_revs": w.get("entry_recent_revs"),
         "entry_volatility": w.get("entry_volatility"),
         "entry_vol_stats": w.get("entry_vol_stats"),
+        "entry_hold": w.get("entry_hold"),
+        "close_time": w.get("close_time"),
     }
     t = threading.Thread(target=_settle_worker, args=(settle_data, asset, tf), daemon=True)
     t.start()
@@ -2295,8 +2320,19 @@ def _settle_worker(d, asset, tf):
     emoji = ASSET_EMOJI.get(asset, "")
     out_emoji = "✅" if won else "❌"
 
+    # Entry conditions on the result line, so a LOSS carries its own numbers for
+    # forensics: what was the move and move-hold when it entered.
+    em_pct = d.get("entry_move")
+    em_hold = d.get("entry_hold")
+    cond_bits = []
+    if em_pct is not None:
+        cond_bits.append(f"{em_pct:+.3f}%")
+    if em_hold is not None:
+        cond_bits.append(f"hold {em_hold:.3f}")
+    cond_str = (" · entry: " + " · ".join(cond_bits)) if cond_bits else ""
+
     tg(f"{out_emoji} {emoji}{asset} {tf}m {d['direction']} · ${pl:+.3f} · "
-       f"bal ${state['balance_usd']:.2f} · {total}·{wr}")
+       f"bal ${state['balance_usd']:.2f} · {total}·{wr}{cond_str}")
 
     # Auto-pause after consecutive losses
     if not won and state["consecutive_losses"] >= CONFIG["consecutive_loss_limit"]:
