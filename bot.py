@@ -699,11 +699,60 @@ BINANCE_FUTURES_SYMBOL_TO_ASSET = {"HYPEUSDT": "HYPE"}
 
 prices_binance      = {}
 binance_last_update = {}
-_lag_ticks      = {a: deque() for a in ASSET_LIST}   # recent (ts, price) Binance ticks
+_lag_ticks      = {a: deque() for a in ASSET_LIST}   # recent (ts, price) Binance ticks (5s)
 _lag_last_event = {a: 0.0 for a in ASSET_LIST}
 _lag_results    = {a: [] for a in ASSET_LIST}        # lag seconds, current report window
 _lag_timeouts   = {a: 0 for a in ASSET_LIST}         # events the feed never matched in time
 _lag_lock       = threading.Lock()
+
+# Long buffer for forensics: keeps ~10 min of (ts, price, qty) per asset so we can
+# compute the 10-minute trend and recent traded volume. Fed by the same tick
+# handler; memory-only, no extra network. Pruned to FORENSIC_TREND_SECS.
+FORENSIC_TREND_SECS = int(os.environ.get("FORENSIC_TREND_SECS", "600"))  # 10 min
+_long_ticks = {a: deque() for a in ASSET_LIST}
+_long_lock  = threading.Lock()
+
+
+def _push_long_tick(asset, ts, price, qty):
+    """Store a tick in the 10-min forensic buffer (price + Binance trade qty)."""
+    with _long_lock:
+        dq = _long_ticks[asset]
+        dq.append((ts, price, qty))
+        cutoff = ts - FORENSIC_TREND_SECS
+        while dq and dq[0][0] < cutoff:
+            dq.popleft()
+
+
+def forensic_trend_pct(asset, lookback_secs=600):
+    """Signed % move over the last `lookback_secs` (the bigger-picture trend).
+    Compares newest price to the oldest tick within the window. None if no data."""
+    with _long_lock:
+        dq = list(_long_ticks[asset])
+    if len(dq) < 2:
+        return None
+    now = dq[-1][0]
+    cut = now - lookback_secs
+    older = [t for t in dq if t[0] >= cut]
+    if len(older) < 2:
+        return None
+    first_p = older[0][1]
+    last_p = older[-1][1]
+    if first_p <= 0:
+        return None
+    return round((last_p - first_p) / first_p * 100.0, 4)
+
+
+def forensic_volume(asset, lookback_secs=30):
+    """Sum of Binance trade quantity over the last `lookback_secs` — a proxy for
+    'is this move backed by real flow?'. In base-asset units. None if no data."""
+    with _long_lock:
+        dq = list(_long_ticks[asset])
+    if not dq:
+        return None
+    now = dq[-1][0]
+    cut = now - lookback_secs
+    vol = sum(q for (t, p, q) in dq if t >= cut)
+    return round(vol, 2)
 
 
 def _lag_on_tick(asset, ts, price):
@@ -779,10 +828,12 @@ def binance_ws_worker():
                 price = float(d.get("p", 0))
                 if price <= 0:
                     continue
+                qty = float(d.get("q", 0) or 0)
                 now = time.time()
                 prices_binance[asset] = price
                 binance_last_update[asset] = now
                 _lag_on_tick(asset, now, price)
+                _push_long_tick(asset, now, price, qty)
         except Exception as e:
             log.warning(f"[Binance WS] error: {e} - reconnecting in 3s")
         finally:
@@ -816,10 +867,12 @@ def binance_futures_ws_worker():
                 price = float(d.get("p", 0))
                 if price <= 0:
                     continue
+                qty = float(d.get("q", 0) or 0)
                 now = time.time()
                 prices_binance[asset] = price
                 binance_last_update[asset] = now
                 _lag_on_tick(asset, now, price)
+                _push_long_tick(asset, now, price, qty)
         except Exception as e:
             log.warning(f"[Binance Futures WS] error: {e} - reconnecting in 3s")
         finally:
@@ -982,26 +1035,20 @@ HYPE_MIN_MOVE_PCT     = float(os.environ.get("HYPE_MIN_MOVE_PCT", "0.16"))
 STACK_MAX        = int(os.environ.get("STACK_MAX", "3"))
 STACK_GAP_SECS   = float(os.environ.get("STACK_GAP_SECS", "12"))
 
-# ── WOBBLE FILTER (the "if it's wobbling like crazy, don't enter" gate) ───────
-# Measures the BIGGEST single-second price jump in the recent window, as a % of
-# price. A calm market moves in tiny steps (small max-jump). A market wobbling
-# like crazy lurches a lot in one second (big max-jump). If the biggest jump is
-# over MAX_JUMP, skip the window — exactly what you do by eye when the live price
-# is bouncing wildly. MAX_JUMP = 0.0 means OFF (logs the number, never skips), so
-# you watch real values first, then set the threshold. From the test shapes: calm
-# moves ~0.02, wild ones 0.16+, so a threshold around 0.10 cleanly separates them.
-MAX_JUMP   = float(os.environ.get("MAX_JUMP", "0.0"))
-WOBBLE_SECS = int(os.environ.get("WOBBLE_SECS", "30"))  # window the max-jump looks back over
-
-# ── THREE MORE WOBBLE METRICS (jitter / CHOP / KER), all OFF by default ───────
-# Each has its own skip knob. The bot LOGS all three on every entry regardless,
-# so you collect real numbers; a metric only SKIPS when its knob is set non-zero
-# (jitter/CHOP are "skip if ABOVE", KER is "skip if BELOW", matching their scales).
-# All share WOBBLE_SECS as the lookback window. From the shape tests: jitter calm
-# ~0.04-0.12 / wild 0.4+; CHOP 0-100 (high=choppy); KER 0-1 (low=noisy).
-MAX_JITTER = float(os.environ.get("MAX_JITTER", "0.0"))   # skip if jitter > this (0 = off)
-MAX_CHOP   = float(os.environ.get("MAX_CHOP",   "0.0"))   # skip if CHOP  > this (0 = off)
-MIN_KER    = float(os.environ.get("MIN_KER",    "0.0"))   # skip if KER   < this (0 = off)
+# ── PER-CLIP FORENSIC LOGGING ────────────────────────────────────────────────
+# Replaces the single max-jump/jitter/chop/ker wobble filters. Instead of one
+# filter, we now CAPTURE a full snapshot of market conditions at EACH clip's
+# entry moment — and (critically) store it PER CLIP so a stacked window keeps a
+# separate record for every fill instead of overwriting. Each clip emits its own
+# settlement message with all signals, so a loss carries the exact conditions it
+# entered under. This is measurement only — none of it filters/skips anything.
+# Signals captured (all from data the bot already streams):
+#   move%, jitter, chop, ker (kept as raw numbers, no longer used as filters)
+#   binance velocity (is the move still pushing at entry?)
+#   secs since the binance direction last flipped (is the move fresh or settled?)
+#   bin_minus_cl (oracle lag: is the settlement feed ahead of/behind real price?)
+#   major agreement (do BTC & ETH agree with this entry's direction?)
+FORENSIC_SECS = int(os.environ.get("FORENSIC_SECS", "30"))  # lookback for jitter/chop/ker
 
 
 def frontier_locked(asset, abs_move_pct, secs_left, tf=5):
@@ -1508,6 +1555,214 @@ def measure_ker(hist, seconds=30):
     return round(net / vol, 4)
 
 
+def forensic_velocity(asset):
+    """Binance velocity right now: %/sec over the recent (~5s) tick window. Tells
+    us if the move is STILL pushing at entry or has stalled/turned. Signed. None
+    if no data."""
+    dq = _lag_ticks.get(asset)
+    if not dq or len(dq) < 2:
+        return None
+    first_ts, first_p = dq[0][0], dq[0][1]
+    last_ts, last_p = dq[-1][0], dq[-1][1]
+    dt = last_ts - first_ts
+    if dt <= 0 or first_p <= 0:
+        return None
+    return round((last_p - first_p) / first_p * 100.0 / dt, 4)  # %/sec
+
+
+def forensic_secs_since_flip(asset, lookback_secs=120):
+    """Seconds since the Binance price direction last flipped sign, using the long
+    buffer. A move that just flipped is fragile; one that's been one-way for a
+    while is solid. None if no data."""
+    with _long_lock:
+        dq = list(_long_ticks[asset])
+    if len(dq) < 3:
+        return None
+    now = dq[-1][0]
+    cut = now - lookback_secs
+    seg = [(t, p) for (t, p, q) in dq if t >= cut]
+    if len(seg) < 3:
+        return None
+    last_flip_ts = seg[0][0]
+    prev_sign = None
+    for i in range(1, len(seg)):
+        d = seg[i][1] - seg[i-1][1]
+        if d == 0:
+            continue
+        cur = 1 if d > 0 else -1
+        if prev_sign is not None and cur != prev_sign:
+            last_flip_ts = seg[i][0]
+        prev_sign = cur
+    return int(now - last_flip_ts)
+
+
+def forensic_oracle_lag(asset):
+    """bin_minus_cl: Binance move vs Chainlink move from the window open is not
+    available here, so we report the raw instantaneous gap — Binance price vs
+    Chainlink price as a % (how far the settlement feed is from real price right
+    now). Positive = Binance above Chainlink. None if either feed missing."""
+    bp = prices_binance.get(asset)
+    cp = prices_chainlink.get(asset)
+    if not bp or not cp or cp <= 0:
+        return None
+    return round((bp - cp) / cp * 100.0, 4)
+
+
+def forensic_majors(direction):
+    """Do BTC and ETH currently agree with this entry's direction? Returns a short
+    string like 'BTC↑ ETH↓' plus an 'agree'/'split' tag. Uses active_directions
+    (the live per-asset signal direction) where available, else None."""
+    def dir_of(a):
+        d = active_directions.get((a, 5)) or active_directions.get((a, 15))
+        return d
+    btc = dir_of("BTC")
+    eth = dir_of("ETH")
+    if btc is None and eth is None:
+        return None
+    def arrow(d):
+        return "↑" if d == "UP" else ("↓" if d == "DOWN" else "·")
+    agree = (btc == direction) and (eth == direction) if (btc and eth) else None
+    tag = "agree" if agree else ("split" if agree is False else "partial")
+    return f"BTC{arrow(btc)} ETH{arrow(eth)} ({tag})"
+
+
+def forensic_book(token_id):
+    """FAIL-SAFE order-book snapshot for LOGGING ONLY. Fetches the full Level-2
+    book and computes bid/ask depth, imbalance, spread. Wrapped so ANY error or
+    missing data returns a dict of Nones — it can NEVER raise into the trade path.
+    This must never block or delay order placement; it's pure instrumentation."""
+    out = {"bid": None, "ask": None, "bid_sz": None, "ask_sz": None,
+           "imbalance": None, "spread": None}
+    if not clob_client:
+        return out
+    try:
+        ob = clob_client.get_order_book(token_id)
+        if not ob:
+            return out
+        if isinstance(ob, dict):
+            bids = ob.get("bids", []) or []
+            asks = ob.get("asks", []) or []
+        else:
+            bids = getattr(ob, "bids", []) or []
+            asks = getattr(ob, "asks", []) or []
+
+        def _p(x):
+            return float(x.get("price", 0)) if isinstance(x, dict) else float(getattr(x, "price", 0))
+
+        def _s(x):
+            return float(x.get("size", 0)) if isinstance(x, dict) else float(getattr(x, "size", 0))
+
+        best_bid = max((_p(b) for b in bids if _p(b) > 0), default=None)
+        best_ask = min((_p(a) for a in asks if _p(a) > 0), default=None)
+        bid_sz = sum(_s(b) for b in bids)
+        ask_sz = sum(_s(a) for a in asks)
+        out["bid"] = round(best_bid * 100, 1) if best_bid else None
+        out["ask"] = round(best_ask * 100, 1) if best_ask else None
+        out["bid_sz"] = round(bid_sz, 0)
+        out["ask_sz"] = round(ask_sz, 0)
+        if ask_sz and ask_sz > 0:
+            out["imbalance"] = round(bid_sz / ask_sz, 2)
+        if best_bid and best_ask:
+            out["spread"] = round((best_ask - best_bid) * 100, 1)
+        return out
+    except Exception as e:
+        log.warning(f"[FORENSIC] book fetch failed (logging only, trade unaffected): {e}")
+        return out
+
+
+def build_forensic_snapshot(asset, tf, direction, hist, open_price, secs_left,
+                            move_pct, token_id):
+    """Assemble ALL forensic signals at this clip's entry moment into one dict.
+    Pure measurement — never affects trading. Each field is independently
+    fail-safe (None if its data isn't available)."""
+    snap = {
+        "move": round(move_pct, 4),
+        "secs_left": secs_left,
+        "jitter": measure_jitter(hist, open_price, seconds=FORENSIC_SECS),
+        "chop": measure_chop(hist, seconds=FORENSIC_SECS),
+        "ker": measure_ker(hist, seconds=FORENSIC_SECS),
+        "velocity": forensic_velocity(asset),
+        "since_flip": forensic_secs_since_flip(asset),
+        "trend10m": forensic_trend_pct(asset, FORENSIC_TREND_SECS),
+        "volume": forensic_volume(asset, 30),
+        "oracle_lag": forensic_oracle_lag(asset),
+        "majors": forensic_majors(direction),
+        "book": forensic_book(token_id),
+    }
+    return snap
+
+
+def format_forensic_snapshot(snap, asset, tf, direction, clip_idx=None, clip_total=None):
+    """Render a forensic snapshot into a full multi-line Telegram message body,
+    with ⚠️/✓ flags so a loss visibly shows which conditions were off at entry."""
+    em = ASSET_EMOJI.get(asset, "")
+    arrow = "🔺" if direction == "UP" else "🔻"
+    clip_str = ""
+    if clip_idx is not None and clip_total is not None:
+        clip_str = f" · clip {clip_idx}/{clip_total}"
+
+    def flag_vel(v):
+        if v is None:
+            return "—"
+        # pushing in the bet's direction is good
+        good = (direction == "UP" and v > 0) or (direction == "DOWN" and v < 0)
+        return f"{v:+.4f}%/s ({'pushing ✓' if good else 'FADING ⚠️'})"
+
+    def flag_flip(s):
+        if s is None:
+            return "—"
+        return f"{s}s ({'solid ✓' if s >= 30 else 'fresh ⚠️'})"
+
+    def flag_trend(t):
+        if t is None:
+            return "—"
+        aligned = (direction == "UP" and t > 0) or (direction == "DOWN" and t < 0)
+        return f"{t:+.3f}% ({'aligned ✓' if aligned else 'AGAINST ⚠️'})"
+
+    def flag_lag(l):
+        if l is None:
+            return "—"
+        # if settlement feed (CL) is behind the bet direction, there's room to run
+        # positive l = binance above chainlink; good for UP, bad for DOWN
+        good = (direction == "UP" and l > 0) or (direction == "DOWN" and l < 0)
+        return f"{l:+.3f}% ({'leading ✓' if good else 'stale ⚠️'})"
+
+    b = snap.get("book", {}) or {}
+    imb = b.get("imbalance")
+
+    def flag_imb(x):
+        if x is None:
+            return "—"
+        # bid-heavy (>1) supports a buyer; ask-heavy (<1) is sellers stacked
+        return f"{x} ({'bid-heavy ✓' if x >= 1 else 'ask-heavy ⚠️'})"
+
+    spread = b.get("spread")
+
+    def flag_spread(s):
+        if s is None:
+            return "—"
+        return f"{s}¢ ({'tight ✓' if s <= 10 else 'wide ⚠️'})"
+
+    vol = snap.get("volume")
+    lines = [
+        f"path: jit {snap.get('jitter')} · chop {snap.get('chop')} · ker {snap.get('ker')}",
+        "— move alive? —",
+        f"binance vel: {flag_vel(snap.get('velocity'))}",
+        f"since flip: {flag_flip(snap.get('since_flip'))}",
+        "— bigger trend —",
+        f"10m trend: {flag_trend(snap.get('trend10m'))}",
+        f"majors: {snap.get('majors') or '—'}",
+        f"volume(30s): {vol if vol is not None else '—'}",
+        "— the book —",
+        f"ask {b.get('ask') or '—'}¢ · bid {b.get('bid') or '—'}¢",
+        f"imbalance: {flag_imb(imb)} (bid {b.get('bid_sz') or '—'} / ask {b.get('ask_sz') or '—'})",
+        f"spread: {flag_spread(spread)}",
+        "— oracle lag —",
+        f"Bin vs CL: {flag_lag(snap.get('oracle_lag'))}",
+    ]
+    return "\n".join(lines)
+
+
 def check_momentum(hist, direction, n):
     if len(hist) < n + 1:
         return True
@@ -1902,40 +2157,29 @@ def process_tick():
                 log.info(f"Skipped {asset} {tf}m {dirn} - too choppy ({recent_revs} reversals in 30s)")
                 continue
 
-            # Log the reversal counts for entered trades (for tuning the choppy threshold)
+            # Build the full forensic snapshot for THIS clip's entry moment. This
+            # replaces the old wobble FILTER — nothing is skipped on these numbers
+            # now; they're captured per-clip for analysis. The book fetch inside is
+            # fail-safe (logging only, can never block the trade).
             vol_stats = measure_vol_stats(hist, seconds=30)
-            max_jump = measure_max_jump(hist, w["open_price"], seconds=WOBBLE_SECS)
-            jitter = measure_jitter(hist, w["open_price"], seconds=WOBBLE_SECS)
-            chop = measure_chop(hist, seconds=WOBBLE_SECS)
-            ker = measure_ker(hist, seconds=WOBBLE_SECS)
+            _cond_id, _up_tok, _down_tok = find_market_for_window(asset, tf, open_time)
+            _token_id = _up_tok if dirn == "UP" else _down_tok
+            snap = build_forensic_snapshot(asset, tf, dirn, hist, w["open_price"],
+                                           secs_left, pct, _token_id)
 
-            # ── WOBBLE FILTERS ──  ("if the live price is wobbling like crazy, back off")
-            # Four independent measures, each OFF by default (knob = 0). All are
-            # always logged; a measure only SKIPS when its knob is set. jitter/CHOP
-            # skip ABOVE their threshold, KER skips BELOW (it's high=clean).
-            wobble_skip = None
-            if MAX_JUMP > 0 and max_jump is not None and max_jump > MAX_JUMP:
-                wobble_skip = f"max-jump {max_jump:.4f}% > {MAX_JUMP:.4f}%"
-            elif MAX_JITTER > 0 and jitter is not None and jitter > MAX_JITTER:
-                wobble_skip = f"jitter {jitter:.4f}% > {MAX_JITTER:.4f}%"
-            elif MAX_CHOP > 0 and chop is not None and chop > MAX_CHOP:
-                wobble_skip = f"chop {chop:.1f} > {MAX_CHOP:.1f}"
-            elif MIN_KER > 0 and ker is not None and ker < MIN_KER:
-                wobble_skip = f"ker {ker:.4f} < {MIN_KER:.4f}"
-            if wobble_skip:
-                w["skipped"] = True
-                log.info(f"[WOBBLE] skipped {asset} {tf}m {dirn}: {wobble_skip} (move={pct:+.3f}%, {secs_left}s left)")
-                db_log_skip(asset, tf, dirn, pct, w["open_price"], 0,
-                            f"wobble: {wobble_skip}", open_time, close_time, secs_left)
-                continue
-
-            log.info(f"ENTER {asset} {tf}m {dirn} - window_revs={revs}/{max_revs}, 30s_revs={recent_revs}/{CONFIG['choppy_threshold']}, move={pct:+.3f}%, maxjump={max_jump}, jitter={jitter}, chop={chop}, ker={ker}, net={vol_stats['net']:+.4f}% avg={vol_stats['avg']:.4f} rv={vol_stats['rv']:.4f} big={vol_stats['big']}")
+            log.info(f"ENTER {asset} {tf}m {dirn} - move={pct:+.3f}%, jit={snap['jitter']}, "
+                     f"chop={snap['chop']}, ker={snap['ker']}, vel={snap['velocity']}, "
+                     f"flip={snap['since_flip']}, trend10m={snap['trend10m']}, "
+                     f"lag={snap['oracle_lag']}, vol={snap['volume']}, book={snap['book']}")
             w["entry_volatility"] = volatility
             w["entry_vol_stats"] = vol_stats
-            w["entry_jump"] = max_jump
-            w["entry_jitter"] = jitter
-            w["entry_chop"] = chop
-            w["entry_ker"] = ker
+            # PER-CLIP: append this clip's snapshot to a list so a stacked window
+            # keeps a separate record for every fill (no more overwriting). Each
+            # entry into enter_trade corresponds to one clip; settlement emits one
+            # message per stored snapshot.
+            w.setdefault("clip_snaps", []).append(snap)
+            # Keep entry_move for the existing maker fill-record path.
+            w["entry_move"] = pct
             enter_trade(w, asset, tf, price, pct, dirn, secs_left, open_time, close_time, revs, recent_revs)
 
 
@@ -2333,10 +2577,7 @@ def settle(w, asset, tf, close_price):
         "entry_recent_revs": w.get("entry_recent_revs"),
         "entry_volatility": w.get("entry_volatility"),
         "entry_vol_stats": w.get("entry_vol_stats"),
-        "entry_jump": w.get("entry_jump"),
-        "entry_jitter": w.get("entry_jitter"),
-        "entry_chop": w.get("entry_chop"),
-        "entry_ker": w.get("entry_ker"),
+        "clip_snaps": w.get("clip_snaps", []),
         "close_time": w.get("close_time"),
     }
     t = threading.Thread(target=_settle_worker, args=(settle_data, asset, tf), daemon=True)
@@ -2425,28 +2666,25 @@ def _settle_worker(d, asset, tf):
     emoji = ASSET_EMOJI.get(asset, "")
     out_emoji = "✅" if won else "❌"
 
-    # Entry conditions on the result line, so a LOSS carries its own numbers for
-    # forensics: the move and all wobble metrics (jump/jitter/chop/ker) at entry.
-    em_pct = d.get("entry_move")
-    em_jump = d.get("entry_jump")
-    em_jitter = d.get("entry_jitter")
-    em_chop = d.get("entry_chop")
-    em_ker = d.get("entry_ker")
-    cond_bits = []
-    if em_pct is not None:
-        cond_bits.append(f"{em_pct:+.3f}%")
-    if em_jump is not None:
-        cond_bits.append(f"jump {em_jump:.3f}")
-    if em_jitter is not None:
-        cond_bits.append(f"jit {em_jitter:.3f}")
-    if em_chop is not None:
-        cond_bits.append(f"chop {em_chop:.0f}")
-    if em_ker is not None:
-        cond_bits.append(f"ker {em_ker:.2f}")
-    cond_str = (" · entry: " + " · ".join(cond_bits)) if cond_bits else ""
-
-    tg(f"{out_emoji} {emoji}{asset} {tf}m {d['direction']} · ${pl:+.3f} · "
-       f"bal ${state['balance_usd']:.2f} · {total}·{wr}{cond_str}")
+    # PER-CLIP forensic settlement. A stacked window has multiple clips, each with
+    # its own entry snapshot — emit ONE full message per clip so every fill carries
+    # the exact conditions it entered under (a loss shows which signals were off).
+    clip_snaps = d.get("clip_snaps") or []
+    base = (f"{out_emoji} {emoji}{asset} {tf}m {d['direction']} · ${pl:+.3f} · "
+            f"bal ${state['balance_usd']:.2f} · {total}·{wr}")
+    if not clip_snaps:
+        # No snapshot (shouldn't happen, but stay safe) — send the plain result line.
+        tg(base)
+    else:
+        n = len(clip_snaps)
+        for i, snap in enumerate(clip_snaps, 1):
+            header = base if n == 1 else (
+                f"{out_emoji} {emoji}{asset} {tf}m {d['direction']} · clip {i}/{n} · "
+                f"${pl:+.3f} · bal ${state['balance_usd']:.2f} · {total}·{wr}")
+            body = format_forensic_snapshot(snap, asset, tf, d["direction"],
+                                            clip_idx=(i if n > 1 else None),
+                                            clip_total=(n if n > 1 else None))
+            tg(header + "\n" + f"entry: {snap.get('move'):+.3f}% · {snap.get('secs_left')}s left\n" + body)
 
     # Auto-pause after consecutive losses
     if not won and state["consecutive_losses"] >= CONFIG["consecutive_loss_limit"]:
