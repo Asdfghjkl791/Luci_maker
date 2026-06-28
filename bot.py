@@ -943,45 +943,37 @@ MAKER_BAILOUT_CENTS      = float(os.environ.get("MAKER_BAILOUT_CENTS", "96.0"))
 #
 # Each row: (max_secs_left, min_abs_move_pct), ascending max_secs.
 PER_ASSET_FRONTIER = {
-    "BTC":  [(10, 0.05), (20, 0.10), (40, 0.10), (70, 0.20), (120, 0.40)],
-    "ETH":  [(10, 0.05), (20, 0.10), (40, 0.20), (70, 0.40), (120, 0.40)],
-    "SOL":  [(10, 0.10), (20, 0.20), (40, 0.40), (70, 0.40), (120, 0.40)],
-    "XRP":  [(10, 0.05), (20, 0.10), (40, 0.10), (70, 0.20), (120, 0.40)],
-    "DOGE": [(10, 0.05), (20, 0.10), (40, 0.10), (70, 0.20), (120, 0.40)],
-    "BNB":  [(10, 0.05), (20, 0.10), (40, 0.10), (70, 0.20), (120, 0.40)],
-    "HYPE": [(10, 0.10), (20, 0.20), (40, 0.40), (70, 0.40), (120, 0.40)],
+    "BTC":  [(20, 0.025), (40, 0.04), (70, 0.08), (120, 0.15)],
+    "ETH":  [(20, 0.03), (40, 0.07), (70, 0.11), (120, 0.16)],
+    "XRP":  [(20, 0.04), (40, 0.10), (70, 0.15), (120, 0.23)],
+    "DOGE": [(20, 0.05), (40, 0.10), (70, 0.15), (120, 0.22)],
+    "BNB":  [(20, 0.04), (40, 0.10), (70, 0.17), (120, 0.20)],
+    "SOL":  [(20, 0.10), (40, 0.17), (70, 0.21), (120, 0.27)],
+    "HYPE": [(20, 0.16), (40, 0.20), (70, 0.24), (120, 0.30)],
 }
 
-# ── VARIANT: PER-ASSET 15m frontier — MEASURED from the probe /grid ──────────
-# Now measured (replaces the old scaling GUESS). A 15m window has far more
-# elapsed time, so at long time-left a smaller current move is already "locked"
-# than the same time-left in a 5m window — which is why several 15m long-band
-# thresholds sit BELOW their 5m counterparts. Some 15m cells were still noisy
-# (non-monotonic), so these are smoothed to be monotonic-ascending and rounded
-# to bucket edges. Less battle-tested than the 5m table; revisit as 15m fills.
-PER_ASSET_FRONTIER_15M = {
-    "BTC":  [(10, 0.05), (20, 0.10), (40, 0.10), (70, 0.10), (120, 0.10)],
-    "ETH":  [(10, 0.05), (20, 0.10), (40, 0.20), (70, 0.40), (120, 0.40)],
-    "SOL":  [(10, 0.10), (20, 0.10), (40, 0.20), (70, 0.40), (120, 0.40)],
-    "XRP":  [(10, 0.05), (20, 0.10), (40, 0.10), (70, 0.10), (120, 0.20)],
-    "DOGE": [(10, 0.05), (20, 0.10), (40, 0.20), (70, 0.20), (120, 0.20)],
-    "BNB":  [(10, 0.05), (20, 0.10), (40, 0.20), (70, 0.20), (120, 0.20)],
-    "HYPE": [(10, 0.05), (20, 0.10), (40, 0.20), (70, 0.40), (120, 0.40)],
-}
-
-# Fallback for anything past 120s left, or an asset not in the tables.
-GLOBAL_FRONTIER = [(10, 0.05), (20, 0.10), (40, 0.20), (70, 0.40), (120, 0.40)]
+# 15-MINUTE gate. We do NOT have a measured 15m frontier yet, and the few real
+# points show 15m needs MUCH bigger moves than 5m (e.g. HYPE15 +0.785% @116s;
+# BNB15 -0.235% @227s). The earlier you are in a 15m window, the bigger the move
+# must be. We build 15m off each asset's 5m 40-70s threshold (a mid, not the tiny
+# buzzer number) and scale UP steeply with time-left. Conservative on purpose -
+# this should SKIP small moves like ETH -0.058% @40s. Replace with the probe's
+# measured 15m surface when it has enough samples.
+def _frontier_15m(asset, secs_left):
+    bands = PER_ASSET_FRONTIER.get(asset, GLOBAL_FRONTIER)
+    base = bands[2][1] if len(bands) >= 3 else bands[-1][1]
+    if secs_left <= 20:
+        return base * 1.3
+    if secs_left <= 70:
+        return base * 1.8
+    if secs_left <= 180:
+        return base * 2.3
+    return base * 3.0
+# Fallback table for any asset not listed above (mirrors the old global gate).
+GLOBAL_FRONTIER = [(3, 0.02), (40, 0.10), (70, 0.20), (120, 0.40)]
 FRONTIER_FALLBACK_PCT = float(os.environ.get("FRONTIER_FALLBACK_PCT", "0.40"))
-# HYPE floor now redundant — HYPE's measured table is already strict. Off by
-# default (0.0); set HYPE_MIN_MOVE_PCT>0 to re-impose an extra hard floor.
-HYPE_MIN_MOVE_PCT     = float(os.environ.get("HYPE_MIN_MOVE_PCT", "0.0"))
-
-
-def _frontier_lookup(bands, secs_left):
-    for max_secs, min_move in bands:
-        if secs_left <= max_secs:
-            return min_move
-    return FRONTIER_FALLBACK_PCT
+# Optional hard floor for HYPE on top of its table (belt-and-suspenders).
+HYPE_MIN_MOVE_PCT     = float(os.environ.get("HYPE_MIN_MOVE_PCT", "0.16"))
 
 # ── VARIANT: stacking ────────────────────────────────────────────────────────
 # Re-enter the SAME window multiple times while the move stays above threshold
@@ -990,19 +982,44 @@ def _frontier_lookup(bands, secs_left):
 STACK_MAX        = int(os.environ.get("STACK_MAX", "3"))
 STACK_GAP_SECS   = float(os.environ.get("STACK_GAP_SECS", "12"))
 
+# ── WOBBLE FILTER (the "if it's wobbling like crazy, don't enter" gate) ───────
+# Measures the BIGGEST single-second price jump in the recent window, as a % of
+# price. A calm market moves in tiny steps (small max-jump). A market wobbling
+# like crazy lurches a lot in one second (big max-jump). If the biggest jump is
+# over MAX_JUMP, skip the window — exactly what you do by eye when the live price
+# is bouncing wildly. MAX_JUMP = 0.0 means OFF (logs the number, never skips), so
+# you watch real values first, then set the threshold. From the test shapes: calm
+# moves ~0.02, wild ones 0.16+, so a threshold around 0.10 cleanly separates them.
+MAX_JUMP   = float(os.environ.get("MAX_JUMP", "0.0"))
+WOBBLE_SECS = int(os.environ.get("WOBBLE_SECS", "30"))  # window the max-jump looks back over
+
+# ── THREE MORE WOBBLE METRICS (jitter / CHOP / KER), all OFF by default ───────
+# Each has its own skip knob. The bot LOGS all three on every entry regardless,
+# so you collect real numbers; a metric only SKIPS when its knob is set non-zero
+# (jitter/CHOP are "skip if ABOVE", KER is "skip if BELOW", matching their scales).
+# All share WOBBLE_SECS as the lookback window. From the shape tests: jitter calm
+# ~0.04-0.12 / wild 0.4+; CHOP 0-100 (high=choppy); KER 0-1 (low=noisy).
+MAX_JITTER = float(os.environ.get("MAX_JITTER", "0.0"))   # skip if jitter > this (0 = off)
+MAX_CHOP   = float(os.environ.get("MAX_CHOP",   "0.0"))   # skip if CHOP  > this (0 = off)
+MIN_KER    = float(os.environ.get("MIN_KER",    "0.0"))   # skip if KER   < this (0 = off)
+
 
 def frontier_locked(asset, abs_move_pct, secs_left, tf=5):
-    """True if (move, time-left) clears THIS asset's MEASURED lock frontier for
-    this timeframe. Both 5m and 15m now use measured per-asset tables from the
-    probe /grid (no more guessing)."""
+    """True if (move, time-left) clears THIS asset's lock frontier for this
+    timeframe. 5m uses the measured per-asset table; 15m uses the conservative
+    time-scaled rule (see _frontier_15m)."""
     if secs_left <= 0:
         return False
     if tf == 15:
-        bands = PER_ASSET_FRONTIER_15M.get(asset, GLOBAL_FRONTIER)
+        need = _frontier_15m(asset, secs_left)
     else:
         bands = PER_ASSET_FRONTIER.get(asset, GLOBAL_FRONTIER)
-    need = _frontier_lookup(bands, secs_left)
-    if asset == "HYPE" and HYPE_MIN_MOVE_PCT > 0:
+        need = FRONTIER_FALLBACK_PCT
+        for max_secs, min_move in bands:
+            if secs_left <= max_secs:
+                need = min_move
+                break
+    if asset == "HYPE":
         need = max(need, HYPE_MIN_MOVE_PCT)
     return abs_move_pct >= need
 
@@ -1412,25 +1429,83 @@ def measure_vol_stats(hist, seconds=30, big_jump_pct=0.02):
     return stats
 
 
-def measure_move_hold(hist, open_price, seconds=60):
-    """MOVE-HOLD instability over the last N seconds (the metric we measure in the
-    probe). Looks at the move-from-open — (price - open) — each second and measures
-    how much that sequence DECAYS (slides toward zero) or SWINGS (bounces). Low =
-    the move held steady (good); high = decaying/swinging (bad). In % of price.
-    Returns None if not enough history or no open price."""
+def measure_max_jump(hist, open_price, seconds=30):
+    """WOBBLE measure: the biggest single second-to-second price move in the last
+    N seconds, as a % of price. Calm market = tiny steps = small number. Market
+    wobbling like crazy = big lurches = big number. This is the mechanical version
+    of 'watch the live price; if it's jumping around wildly, back off.' Returns
+    None if not enough history."""
     if not open_price or open_price <= 0:
         return None
+    if len(hist) < 2:
+        return None
+    recent = list(hist)[-seconds:]
+    if len(recent) < 2:
+        return None
+    biggest = max(abs(recent[i+1] - recent[i]) for i in range(len(recent)-1))
+    return round(biggest / open_price * 100.0, 4)
+
+
+def measure_jitter(hist, open_price, seconds=30):
+    """TOTAL JITTER: sum of ALL second-to-second price moves over the last N
+    seconds, as % of price. Captures big AND frequent wobble — big jumps add a
+    lot, and many small jumps still add up (can't be dodged by staying 'just
+    under' a per-jump threshold). Higher = more wobble. Returns None if not
+    enough history."""
+    if not open_price or open_price <= 0:
+        return None
+    if len(hist) < 2:
+        return None
+    recent = list(hist)[-seconds:]
+    if len(recent) < 2:
+        return None
+    total = sum(abs(recent[i+1] - recent[i]) for i in range(len(recent)-1))
+    return round(total / open_price * 100.0, 4)
+
+
+def measure_chop(hist, seconds=30):
+    """CHOPPINESS INDEX (Dreiss), 0-100. High = choppy/sideways, low = trending.
+    CHOP = 100 * LOG10( SUM(|step|) / (max-min) ) / LOG10(n). Normalized, so it
+    can't blow up on calm markets. Catches sideways whipsaw; tends to MISS violent
+    one-way spikes (they look 'trending'). Returns None if not enough history or
+    zero range."""
     if len(hist) < 3:
         return None
     recent = list(hist)[-seconds:]
     if len(recent) < 3:
         return None
-    diffs = [(p - open_price) / open_price * 100.0 for p in recent if p > 0]
-    if len(diffs) < 3:
+    seq = [p for p in recent if p > 0]
+    if len(seq) < 3:
         return None
-    level = diffs[-1]  # where the move currently sits
-    mad = sum(abs(d - level) for d in diffs) / len(diffs)
-    return round(mad, 4)
+    tr_sum = sum(abs(seq[i+1] - seq[i]) for i in range(len(seq)-1))
+    hi, lo = max(seq), min(seq)
+    rng = hi - lo
+    n = len(seq) - 1
+    if rng <= 0 or tr_sum <= 0 or n < 2:
+        return None
+    import math
+    return round(100 * math.log10(tr_sum / rng) / math.log10(n), 2)
+
+
+def measure_ker(hist, seconds=30):
+    """KAUFMAN EFFICIENCY RATIO, 0-1. High = clean efficient trend, low = noisy.
+    KER = |net change| / sum of |steps|. Catches violent one-way spikes (low-ish,
+    they thrash) better than CHOP; but tends to flag CALM-FLAT markets as noisy
+    (net~0 -> ratio~0). Opposite blind spot from CHOP. Returns None if no
+    movement."""
+    if len(hist) < 3:
+        return None
+    recent = list(hist)[-seconds:]
+    if len(recent) < 3:
+        return None
+    seq = [p for p in recent if p > 0]
+    if len(seq) < 3:
+        return None
+    net = abs(seq[-1] - seq[0])
+    vol = sum(abs(seq[i+1] - seq[i]) for i in range(len(seq)-1))
+    if vol <= 0:
+        return None
+    return round(net / vol, 4)
 
 
 def check_momentum(hist, direction, n):
@@ -1829,11 +1904,38 @@ def process_tick():
 
             # Log the reversal counts for entered trades (for tuning the choppy threshold)
             vol_stats = measure_vol_stats(hist, seconds=30)
-            move_hold = measure_move_hold(hist, w["open_price"], seconds=60)
-            log.info(f"ENTER {asset} {tf}m {dirn} - window_revs={revs}/{max_revs}, 30s_revs={recent_revs}/{CONFIG['choppy_threshold']}, move={pct:+.3f}%, hold={move_hold}, net={vol_stats['net']:+.4f}% avg={vol_stats['avg']:.4f} rv={vol_stats['rv']:.4f} big={vol_stats['big']}")
+            max_jump = measure_max_jump(hist, w["open_price"], seconds=WOBBLE_SECS)
+            jitter = measure_jitter(hist, w["open_price"], seconds=WOBBLE_SECS)
+            chop = measure_chop(hist, seconds=WOBBLE_SECS)
+            ker = measure_ker(hist, seconds=WOBBLE_SECS)
+
+            # ── WOBBLE FILTERS ──  ("if the live price is wobbling like crazy, back off")
+            # Four independent measures, each OFF by default (knob = 0). All are
+            # always logged; a measure only SKIPS when its knob is set. jitter/CHOP
+            # skip ABOVE their threshold, KER skips BELOW (it's high=clean).
+            wobble_skip = None
+            if MAX_JUMP > 0 and max_jump is not None and max_jump > MAX_JUMP:
+                wobble_skip = f"max-jump {max_jump:.4f}% > {MAX_JUMP:.4f}%"
+            elif MAX_JITTER > 0 and jitter is not None and jitter > MAX_JITTER:
+                wobble_skip = f"jitter {jitter:.4f}% > {MAX_JITTER:.4f}%"
+            elif MAX_CHOP > 0 and chop is not None and chop > MAX_CHOP:
+                wobble_skip = f"chop {chop:.1f} > {MAX_CHOP:.1f}"
+            elif MIN_KER > 0 and ker is not None and ker < MIN_KER:
+                wobble_skip = f"ker {ker:.4f} < {MIN_KER:.4f}"
+            if wobble_skip:
+                w["skipped"] = True
+                log.info(f"[WOBBLE] skipped {asset} {tf}m {dirn}: {wobble_skip} (move={pct:+.3f}%, {secs_left}s left)")
+                db_log_skip(asset, tf, dirn, pct, w["open_price"], 0,
+                            f"wobble: {wobble_skip}", open_time, close_time, secs_left)
+                continue
+
+            log.info(f"ENTER {asset} {tf}m {dirn} - window_revs={revs}/{max_revs}, 30s_revs={recent_revs}/{CONFIG['choppy_threshold']}, move={pct:+.3f}%, maxjump={max_jump}, jitter={jitter}, chop={chop}, ker={ker}, net={vol_stats['net']:+.4f}% avg={vol_stats['avg']:.4f} rv={vol_stats['rv']:.4f} big={vol_stats['big']}")
             w["entry_volatility"] = volatility
             w["entry_vol_stats"] = vol_stats
-            w["entry_hold"] = move_hold
+            w["entry_jump"] = max_jump
+            w["entry_jitter"] = jitter
+            w["entry_chop"] = chop
+            w["entry_ker"] = ker
             enter_trade(w, asset, tf, price, pct, dirn, secs_left, open_time, close_time, revs, recent_revs)
 
 
@@ -2231,7 +2333,10 @@ def settle(w, asset, tf, close_price):
         "entry_recent_revs": w.get("entry_recent_revs"),
         "entry_volatility": w.get("entry_volatility"),
         "entry_vol_stats": w.get("entry_vol_stats"),
-        "entry_hold": w.get("entry_hold"),
+        "entry_jump": w.get("entry_jump"),
+        "entry_jitter": w.get("entry_jitter"),
+        "entry_chop": w.get("entry_chop"),
+        "entry_ker": w.get("entry_ker"),
         "close_time": w.get("close_time"),
     }
     t = threading.Thread(target=_settle_worker, args=(settle_data, asset, tf), daemon=True)
@@ -2321,14 +2426,23 @@ def _settle_worker(d, asset, tf):
     out_emoji = "✅" if won else "❌"
 
     # Entry conditions on the result line, so a LOSS carries its own numbers for
-    # forensics: what was the move and move-hold when it entered.
+    # forensics: the move and all wobble metrics (jump/jitter/chop/ker) at entry.
     em_pct = d.get("entry_move")
-    em_hold = d.get("entry_hold")
+    em_jump = d.get("entry_jump")
+    em_jitter = d.get("entry_jitter")
+    em_chop = d.get("entry_chop")
+    em_ker = d.get("entry_ker")
     cond_bits = []
     if em_pct is not None:
         cond_bits.append(f"{em_pct:+.3f}%")
-    if em_hold is not None:
-        cond_bits.append(f"hold {em_hold:.3f}")
+    if em_jump is not None:
+        cond_bits.append(f"jump {em_jump:.3f}")
+    if em_jitter is not None:
+        cond_bits.append(f"jit {em_jitter:.3f}")
+    if em_chop is not None:
+        cond_bits.append(f"chop {em_chop:.0f}")
+    if em_ker is not None:
+        cond_bits.append(f"ker {em_ker:.2f}")
     cond_str = (" · entry: " + " · ".join(cond_bits)) if cond_bits else ""
 
     tg(f"{out_emoji} {emoji}{asset} {tf}m {d['direction']} · ${pl:+.3f} · "
