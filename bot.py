@@ -998,6 +998,85 @@ BOOK_EVO_CAPTURE   = os.environ.get("BOOK_EVO_CAPTURE", "false").lower() == "tru
 BOOK_EVO_POLL_SECS = float(os.environ.get("BOOK_EVO_POLL_SECS", "2.0"))
 BOOK_EVO_MAX_PTS   = int(os.environ.get("BOOK_EVO_MAX_PTS", "40"))  # cap stored samples
 
+# ── PRE-ENTRY BOOK POLLER (off by default) ──────────────────────────────────
+# To show the book in the seconds BEFORE entry, the bot must already be sampling
+# that asset's book before it knows it will enter. So this runs a dedicated
+# background thread that continuously polls the book for the CURRENT live window
+# of every asset/timeframe, keeping a short rolling history per (asset, tf). At
+# entry, build_forensic_snapshot reaches into this buffer and attaches the last
+# few samples leading up to the entry instant — the true pre-entry book movement.
+# WARNING: this polls the flaky get_order_book endpoint for ALL assets
+# continuously, whether or not they ever trade — heavy load on a buggy endpoint.
+# It runs in its OWN thread (never the order-placement path) and is fully
+# fail-safe. OFF by default; turn on only to collect, and turn off if you notice
+# fills degrading (endpoint contention with the trading client).
+PREENTRY_BOOK_CAPTURE   = os.environ.get("PREENTRY_BOOK_CAPTURE", "false").lower() == "true"
+PREENTRY_BOOK_POLL_SECS = float(os.environ.get("PREENTRY_BOOK_POLL_SECS", "2.0"))
+PREENTRY_BOOK_WINDOW    = float(os.environ.get("PREENTRY_BOOK_WINDOW", "15"))  # secs of history to keep
+# Rolling per-(asset,tf) history of (timestamp, book_dict). Memory only.
+_preentry_book = {}
+_preentry_lock = threading.Lock()
+
+
+def _preentry_book_push(asset, tf, book):
+    with _preentry_lock:
+        key = (asset, tf)
+        dq = _preentry_book.setdefault(key, deque())
+        now = time.time()
+        dq.append((now, book))
+        cutoff = now - PREENTRY_BOOK_WINDOW
+        while dq and dq[0][0] < cutoff:
+            dq.popleft()
+
+
+def get_preentry_book_series(asset, tf):
+    """Return the recent pre-entry book samples for (asset, tf) as a list of
+    (secs_ago, book_dict), newest last. Empty if none."""
+    with _preentry_lock:
+        dq = list(_preentry_book.get((asset, tf), ()))
+    if not dq:
+        return []
+    now = time.time()
+    return [(round(now - ts, 1), bk) for ts, bk in dq]
+
+
+def preentry_book_worker():
+    """Dedicated thread: continuously poll the book for the live window of every
+    asset/timeframe and push to the rolling buffer. Fully fail-safe; never touches
+    order placement. Only runs when PREENTRY_BOOK_CAPTURE is on."""
+    while True:
+        try:
+            time.sleep(PREENTRY_BOOK_POLL_SECS)
+            if not clob_client:
+                continue
+            for tf in TIMEFRAMES:
+                open_time, _close, secs_left = get_window_times(tf)
+                if secs_left <= 0:
+                    continue
+                for asset in ASSET_LIST:
+                    try:
+                        cond, up_tok, down_tok = find_market_for_window(asset, tf, open_time)
+                        if not up_tok:
+                            continue
+                        # Sample the UP token's book; bid/ask are symmetric info
+                        # for the window (UP bid ≈ 1 - DOWN ask). One read per
+                        # asset/tf keeps load to 14 reads per cycle.
+                        bk = forensic_book(up_tok)
+                        _preentry_book_push(asset, tf, bk)
+                    except Exception as e:
+                        log.warning(f"[PREENTRY_BOOK] {asset} {tf}m sample failed (ignored): {e}")
+        except Exception as e:
+            log.error(f"[PREENTRY_BOOK] worker error: {e}")
+
+
+def start_preentry_book_poller():
+    if not PREENTRY_BOOK_CAPTURE:
+        log.info("[PREENTRY_BOOK] disabled (PREENTRY_BOOK_CAPTURE=false)")
+        return False
+    threading.Thread(target=preentry_book_worker, daemon=True).start()
+    log.info(f"[PREENTRY_BOOK] started (poll {PREENTRY_BOOK_POLL_SECS}s, keep {PREENTRY_BOOK_WINDOW}s)")
+    return True
+
 # ── VARIANT: PER-ASSET 5m frontier — MEASURED from the probe /grid ───────────
 # Built from 682k+ settled windows (all 7 assets, both timeframes). The bands
 # below use the time-left ranges that had real sample counts (hundreds-to-
@@ -1742,6 +1821,9 @@ def build_forensic_snapshot(asset, tf, direction, hist, open_price, secs_left,
         "oracle_lead": forensic_oracle_lead(asset, binance_open, open_price),
         "majors": forensic_majors(direction),
         "book": forensic_book(token_id),
+        # Pre-entry book movement (the seconds BEFORE this entry), pulled from the
+        # continuous poller's rolling buffer. Empty list if poller is off/no data.
+        "preentry_book": get_preentry_book_series(asset, tf) if PREENTRY_BOOK_CAPTURE else [],
     }
     return snap
 
@@ -1815,7 +1897,43 @@ def format_forensic_snapshot(snap, asset, tf, direction, clip_idx=None, clip_tot
         "— oracle lead —",
         f"Bin vs CL move: {flag_lead(snap.get('oracle_lead'))}",
     ]
+    # Pre-entry book movement (the seconds leading UP TO this entry), if captured.
+    pe = snap.get("preentry_book") or []
+    pe_table = format_preentry_book(pe)
+    if pe_table:
+        lines.append(pe_table)
     return "\n".join(lines)
+
+
+def format_preentry_book(series):
+    """Render the pre-entry book series (list of (secs_ago, book_dict)) into a
+    compact table showing the book in the seconds BEFORE entry. Newest (closest to
+    entry) on the right. Gaps render '—' (flaky endpoint). None if empty."""
+    if not series:
+        return None
+    pts = list(series)
+    if len(pts) > 6:
+        step = len(pts) / 6.0
+        idxs = sorted(set(int(i * step) for i in range(6)) | {len(pts) - 1})
+        pts = [pts[i] for i in idxs]
+
+    def cell(v):
+        return f"{v}" if v is not None else "—"
+
+    # show as "-Xs" before entry; last sample ~entry
+    times = "  ".join(f"-{int(s):>2}s" for s, _ in pts)
+    asks  = "  ".join(f"{cell(bk.get('ask')):>4}" for _, bk in pts)
+    bids  = "  ".join(f"{cell(bk.get('bid')):>4}" for _, bk in pts)
+    deps  = "  ".join(f"{cell(bk.get('bid_sz')):>5}" for _, bk in pts)
+    imbs  = "  ".join(f"{cell(bk.get('imbalance')):>5}" for _, bk in pts)
+    return (
+        "pre-entry book (before → entry):\n"
+        f" ago  {times}\n"
+        f" ask  {asks}\n"
+        f" bid  {bids}\n"
+        f" dep  {deps}\n"
+        f" imb  {imbs}"
+    )
 
 
 def format_book_evolution(series):
@@ -2813,6 +2931,9 @@ def main():
     if MAKER_MODE:
         start_binance_feed()
     maker_ok = start_maker_monitor()
+
+    # Pre-entry book poller (off by default; continuous book sampling for all assets)
+    start_preentry_book_poller()
 
     mode_str = "🚨 SIGNALS-ONLY" if SIGNALS_ONLY_MODE else (
         f"🪧 MAKER - resting {MAKER_BID_CENTS:.0f}¢ bids" if maker_ok else "🤖 TAKER - FAK orders")
