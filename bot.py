@@ -1596,16 +1596,32 @@ def forensic_secs_since_flip(asset, lookback_secs=120):
     return int(now - last_flip_ts)
 
 
-def forensic_oracle_lag(asset):
-    """bin_minus_cl: Binance move vs Chainlink move from the window open is not
-    available here, so we report the raw instantaneous gap — Binance price vs
-    Chainlink price as a % (how far the settlement feed is from real price right
-    now). Positive = Binance above Chainlink. None if either feed missing."""
+def forensic_oracle_lead(asset, binance_open, chainlink_open):
+    """CORRECTED oracle-lead: the difference between how far BINANCE has moved
+    from the window open and how far CHAINLINK has moved from the window open.
+
+        binance_move   = (binance_now   - binance_open)   / binance_open
+        chainlink_move = (chainlink_now - chainlink_open) / chainlink_open
+        lead           = binance_move - chainlink_move    (in %)
+
+    This is the signal with a real mechanism the market can't fully price: if
+    Binance (fast/leading) has already moved but Chainlink (slow/settlement) has
+    not yet caught up, `lead` is non-zero and points at where settlement is about
+    to go. Positive lead = Binance has run further UP than Chainlink has — so
+    Chainlink still has upside to catch up (supports UP). Negative = supports DOWN.
+
+    This REPLACES the old static level-gap version, which only captured the
+    constant ~0.15% basis offset between the feeds (useless: same on every trade).
+    Requires the window-open price for BOTH feeds. None if any input is missing."""
     bp = prices_binance.get(asset)
     cp = prices_chainlink.get(asset)
-    if not bp or not cp or cp <= 0:
+    if not bp or not cp or not binance_open or not chainlink_open:
         return None
-    return round((bp - cp) / cp * 100.0, 4)
+    if binance_open <= 0 or chainlink_open <= 0:
+        return None
+    binance_move = (bp - binance_open) / binance_open * 100.0
+    chainlink_move = (cp - chainlink_open) / chainlink_open * 100.0
+    return round(binance_move - chainlink_move, 4)
 
 
 def forensic_majors(direction):
@@ -1671,21 +1687,24 @@ def forensic_book(token_id):
 
 
 def build_forensic_snapshot(asset, tf, direction, hist, open_price, secs_left,
-                            move_pct, token_id):
-    """Assemble ALL forensic signals at this clip's entry moment into one dict.
+                            move_pct, token_id, binance_open=None):
+    """Assemble the forensic signals at this clip's entry moment into one dict.
     Pure measurement — never affects trading. Each field is independently
-    fail-safe (None if its data isn't available)."""
+    fail-safe (None if its data isn't available).
+
+    Option A signal set: the measures that SURVIVED cross-cluster checking
+    (10m trend, velocity, since-flip, volume, majors, book) plus the CORRECTED
+    oracle-lead. The dead path-shape metrics (jitter/chop/ker) and the old
+    static oracle-lag have been removed — they were confounded with move size or
+    mismeasured and never separated winners from losers."""
     snap = {
         "move": round(move_pct, 4),
         "secs_left": secs_left,
-        "jitter": measure_jitter(hist, open_price, seconds=FORENSIC_SECS),
-        "chop": measure_chop(hist, seconds=FORENSIC_SECS),
-        "ker": measure_ker(hist, seconds=FORENSIC_SECS),
         "velocity": forensic_velocity(asset),
         "since_flip": forensic_secs_since_flip(asset),
         "trend10m": forensic_trend_pct(asset, FORENSIC_TREND_SECS),
         "volume": forensic_volume(asset, 30),
-        "oracle_lag": forensic_oracle_lag(asset),
+        "oracle_lead": forensic_oracle_lead(asset, binance_open, open_price),
         "majors": forensic_majors(direction),
         "book": forensic_book(token_id),
     }
@@ -1719,13 +1738,15 @@ def format_forensic_snapshot(snap, asset, tf, direction, clip_idx=None, clip_tot
         aligned = (direction == "UP" and t > 0) or (direction == "DOWN" and t < 0)
         return f"{t:+.3f}% ({'aligned ✓' if aligned else 'AGAINST ⚠️'})"
 
-    def flag_lag(l):
+    def flag_lead(l):
         if l is None:
             return "—"
-        # if settlement feed (CL) is behind the bet direction, there's room to run
-        # positive l = binance above chainlink; good for UP, bad for DOWN
+        # Corrected oracle-lead: Binance move-from-open minus Chainlink move-from-
+        # open. Positive lead supports UP (Binance ran ahead, CL still to catch
+        # up); negative supports DOWN. Aligned with the bet = settlement still has
+        # room to move our way.
         good = (direction == "UP" and l > 0) or (direction == "DOWN" and l < 0)
-        return f"{l:+.3f}% ({'leading ✓' if good else 'stale ⚠️'})"
+        return f"{l:+.3f}% ({'leading ✓' if good else 'lagging ⚠️'})"
 
     b = snap.get("book", {}) or {}
     imb = b.get("imbalance")
@@ -1745,7 +1766,6 @@ def format_forensic_snapshot(snap, asset, tf, direction, clip_idx=None, clip_tot
 
     vol = snap.get("volume")
     lines = [
-        f"path: jit {snap.get('jitter')} · chop {snap.get('chop')} · ker {snap.get('ker')}",
         "— move alive? —",
         f"binance vel: {flag_vel(snap.get('velocity'))}",
         f"since flip: {flag_flip(snap.get('since_flip'))}",
@@ -1757,8 +1777,8 @@ def format_forensic_snapshot(snap, asset, tf, direction, clip_idx=None, clip_tot
         f"ask {b.get('ask') or '—'}¢ · bid {b.get('bid') or '—'}¢",
         f"imbalance: {flag_imb(imb)} (bid {b.get('bid_sz') or '—'} / ask {b.get('ask_sz') or '—'})",
         f"spread: {flag_spread(spread)}",
-        "— oracle lag —",
-        f"Bin vs CL: {flag_lag(snap.get('oracle_lag'))}",
+        "— oracle lead —",
+        f"Bin vs CL move: {flag_lead(snap.get('oracle_lead'))}",
     ]
     return "\n".join(lines)
 
@@ -1998,6 +2018,10 @@ def process_tick():
                     "open_price": price, "traded": False, "skipped": False,
                     "trade_db_id": None, "direction": None,
                     "last_retry_at": 0,
+                    # Binance price at window open, for the corrected oracle-lead
+                    # (move-from-open differential). May be None if Binance not yet
+                    # warm; the lead computation is fail-safe against that.
+                    "binance_open": prices_binance.get(asset),
                 }
                 price_histories[ws_key].clear()
 
@@ -2165,12 +2189,12 @@ def process_tick():
             _cond_id, _up_tok, _down_tok = find_market_for_window(asset, tf, open_time)
             _token_id = _up_tok if dirn == "UP" else _down_tok
             snap = build_forensic_snapshot(asset, tf, dirn, hist, w["open_price"],
-                                           secs_left, pct, _token_id)
+                                           secs_left, pct, _token_id,
+                                           binance_open=w.get("binance_open"))
 
-            log.info(f"ENTER {asset} {tf}m {dirn} - move={pct:+.3f}%, jit={snap['jitter']}, "
-                     f"chop={snap['chop']}, ker={snap['ker']}, vel={snap['velocity']}, "
+            log.info(f"ENTER {asset} {tf}m {dirn} - move={pct:+.3f}%, vel={snap['velocity']}, "
                      f"flip={snap['since_flip']}, trend10m={snap['trend10m']}, "
-                     f"lag={snap['oracle_lag']}, vol={snap['volume']}, book={snap['book']}")
+                     f"lead={snap['oracle_lead']}, vol={snap['volume']}, book={snap['book']}")
             w["entry_volatility"] = volatility
             w["entry_vol_stats"] = vol_stats
             # PER-CLIP: append this clip's snapshot to a list so a stacked window
