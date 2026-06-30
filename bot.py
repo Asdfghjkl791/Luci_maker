@@ -984,6 +984,20 @@ MAKER_MIN_ASK_CENTS      = float(os.environ.get("MAKER_MIN_ASK_CENTS", "96.0"))
 # placement instant); this guards the RESTING period.
 MAKER_BAILOUT_CENTS      = float(os.environ.get("MAKER_BAILOUT_CENTS", "96.0"))
 
+# ── BOOK EVOLUTION CAPTURE (off by default) ─────────────────────────────────
+# Samples the order book every BOOK_EVO_POLL_SECS for the WHOLE time a bid is
+# resting, storing the full series so a settled trade can show how the book moved
+# from placement → fill (ask/bid/your-side depth/imbalance over time).
+# WARNING: this polls the flaky get_order_book endpoint repeatedly (the one with
+# the ghost-data bug and frequent empty-ask reads), so the captured series WILL
+# have gaps. It runs inside the existing maker_monitor loop (no new thread) and is
+# fully fail-safe — any error is swallowed and never touches order placement. Still,
+# it adds endpoint load on the hot path, so it's OFF unless you turn it on to
+# collect. Each sample is (secs_to_close, book_dict).
+BOOK_EVO_CAPTURE   = os.environ.get("BOOK_EVO_CAPTURE", "false").lower() == "true"
+BOOK_EVO_POLL_SECS = float(os.environ.get("BOOK_EVO_POLL_SECS", "2.0"))
+BOOK_EVO_MAX_PTS   = int(os.environ.get("BOOK_EVO_MAX_PTS", "40"))  # cap stored samples
+
 # ── VARIANT: PER-ASSET 5m frontier — MEASURED from the probe /grid ───────────
 # Built from 682k+ settled windows (all 7 assets, both timeframes). The bands
 # below use the time-left ranges that had real sample counts (hundreds-to-
@@ -1284,6 +1298,10 @@ def _finalize_maker(info, reason):
             }
             db_id = db_insert_trade(trade)
             w["trade_db_id"] = db_id
+            # Carry the book-evolution series (placement→fill) onto the window so
+            # the settlement message can render it. Keyed per clip via a list.
+            if info.get("book_evo"):
+                w.setdefault("clip_book_evo", []).append(info["book_evo"])
             state["balance_usd"] -= cost
             state["trades_today"] += 1
             tg(f"🟢 {emoji}{asset} {tf}m {dirn} · {matched:g}sh@{avg_price*100:.1f}¢ · ${cost:.2f}")
@@ -1319,6 +1337,23 @@ def maker_monitor():
                     continue
                 asset, dirn = info["asset"], info["direction"]
                 secs_to_close = (info["close_time"] - now_dt).total_seconds()
+
+                # ── BOOK EVOLUTION SAMPLE (fail-safe, off by default) ──
+                # Sample the book on its own cadence while the bid rests. Wrapped
+                # so any failure is swallowed and never affects the cancel/fill
+                # logic below. Stores (secs_to_close, book) capped at MAX_PTS.
+                if BOOK_EVO_CAPTURE:
+                    try:
+                        now_m = time.time()
+                        if now_m - info.get("book_evo_last", 0.0) >= BOOK_EVO_POLL_SECS:
+                            info["book_evo_last"] = now_m
+                            bk = forensic_book(info["token_id"])
+                            series = info.setdefault("book_evo", [])
+                            series.append((round(secs_to_close, 1), bk))
+                            if len(series) > BOOK_EVO_MAX_PTS:
+                                del series[0]
+                    except Exception as e:
+                        log.warning(f"[BOOK_EVO] sample failed (ignored): {e}")
 
                 if secs_to_close <= MAKER_CANCEL_T_SECS:
                     threading.Thread(target=_finalize_maker, args=(info, "window closing"), daemon=True).start()
@@ -1783,7 +1818,38 @@ def format_forensic_snapshot(snap, asset, tf, direction, clip_idx=None, clip_tot
     return "\n".join(lines)
 
 
-def check_momentum(hist, direction, n):
+def format_book_evolution(series):
+    """Render a book-evolution series (list of (secs_to_close, book_dict)) into a
+    compact text table showing how ask/bid/your-side-depth/imbalance moved from
+    placement → fill. Samples are time-ordered by secs_to_close DESCENDING (more
+    time left first). Gaps (None) render as '—' because the book endpoint is
+    flaky. Returns None if the series is empty/unusable."""
+    if not series:
+        return None
+    # newest (least time left) last; show up to ~6 evenly-spaced columns so the
+    # message stays readable even if many samples were taken.
+    pts = list(series)
+    if len(pts) > 6:
+        step = len(pts) / 6.0
+        idxs = sorted(set(int(i * step) for i in range(6)) | {len(pts) - 1})
+        pts = [pts[i] for i in idxs]
+
+    def cell(v, suffix=""):
+        return f"{v}{suffix}" if v is not None else "—"
+
+    times = "  ".join(f"{int(s):>3}s" for s, _ in pts)
+    asks  = "  ".join(f"{cell(b.get('ask')):>4}" for _, b in pts)
+    bids  = "  ".join(f"{cell(b.get('bid')):>4}" for _, b in pts)
+    deps  = "  ".join(f"{cell(b.get('bid_sz')):>5}" for _, b in pts)
+    imbs  = "  ".join(f"{cell(b.get('imbalance')):>5}" for _, b in pts)
+    return (
+        "book evolution (placement → fill):\n"
+        f" tleft {times}\n"
+        f" ask   {asks}\n"
+        f" bid   {bids}\n"
+        f" yrdep {deps}\n"
+        f" imbal {imbs}"
+    )
     if len(hist) < n + 1:
         return True
     r = list(hist)[-(n+1):]
@@ -2602,6 +2668,7 @@ def settle(w, asset, tf, close_price):
         "entry_volatility": w.get("entry_volatility"),
         "entry_vol_stats": w.get("entry_vol_stats"),
         "clip_snaps": w.get("clip_snaps", []),
+        "clip_book_evo": w.get("clip_book_evo", []),
         "close_time": w.get("close_time"),
     }
     t = threading.Thread(target=_settle_worker, args=(settle_data, asset, tf), daemon=True)
@@ -2694,6 +2761,7 @@ def _settle_worker(d, asset, tf):
     # its own entry snapshot — emit ONE full message per clip so every fill carries
     # the exact conditions it entered under (a loss shows which signals were off).
     clip_snaps = d.get("clip_snaps") or []
+    clip_book_evo = d.get("clip_book_evo") or []
     base = (f"{out_emoji} {emoji}{asset} {tf}m {d['direction']} · ${pl:+.3f} · "
             f"bal ${state['balance_usd']:.2f} · {total}·{wr}")
     if not clip_snaps:
@@ -2708,7 +2776,13 @@ def _settle_worker(d, asset, tf):
             body = format_forensic_snapshot(snap, asset, tf, d["direction"],
                                             clip_idx=(i if n > 1 else None),
                                             clip_total=(n if n > 1 else None))
-            tg(header + "\n" + f"entry: {snap.get('move'):+.3f}% · {snap.get('secs_left')}s left\n" + body)
+            msg = header + "\n" + f"entry: {snap.get('move'):+.3f}% · {snap.get('secs_left')}s left\n" + body
+            # Append this clip's book-evolution table if captured (off by default).
+            if i - 1 < len(clip_book_evo):
+                evo = format_book_evolution(clip_book_evo[i - 1])
+                if evo:
+                    msg += "\n" + evo
+            tg(msg)
 
     # Auto-pause after consecutive losses
     if not won and state["consecutive_losses"] >= CONFIG["consecutive_loss_limit"]:
