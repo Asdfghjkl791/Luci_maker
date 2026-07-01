@@ -1018,9 +1018,9 @@ _preentry_book = {}
 _preentry_lock = threading.Lock()
 
 
-def _preentry_book_push(asset, tf, book):
+def _preentry_book_push(asset, tf, direction_key, book):
     with _preentry_lock:
-        key = (asset, tf)
+        key = (asset, tf, direction_key)
         dq = _preentry_book.setdefault(key, deque())
         now = time.time()
         dq.append((now, book))
@@ -1029,11 +1029,12 @@ def _preentry_book_push(asset, tf, book):
             dq.popleft()
 
 
-def get_preentry_book_series(asset, tf):
-    """Return the recent pre-entry book samples for (asset, tf) as a list of
-    (secs_ago, book_dict), newest last. Empty if none."""
+def get_preentry_book_series(asset, tf, direction):
+    """Return the recent pre-entry book samples for THIS bet's outcome side as a
+    list of (secs_ago, book_dict), newest last. direction is 'UP'/'DOWN' so we
+    return the book for the token actually bet (not always UP). Empty if none."""
     with _preentry_lock:
-        dq = list(_preentry_book.get((asset, tf), ()))
+        dq = list(_preentry_book.get((asset, tf, direction), ()))
     if not dq:
         return []
     now = time.time()
@@ -1042,8 +1043,10 @@ def get_preentry_book_series(asset, tf):
 
 def preentry_book_worker():
     """Dedicated thread: continuously poll the book for the live window of every
-    asset/timeframe and push to the rolling buffer. Fully fail-safe; never touches
-    order placement. Only runs when PREENTRY_BOOK_CAPTURE is on."""
+    asset/timeframe and push to the rolling buffer. Samples BOTH the UP and DOWN
+    token books so that at entry we can show the side actually bet. Fully
+    fail-safe; never touches order placement. Only runs when PREENTRY_BOOK_CAPTURE
+    is on. NOTE: sampling both sides doubles the book reads per asset."""
     while True:
         try:
             time.sleep(PREENTRY_BOOK_POLL_SECS)
@@ -1056,13 +1059,12 @@ def preentry_book_worker():
                 for asset in ASSET_LIST:
                     try:
                         cond, up_tok, down_tok = find_market_for_window(asset, tf, open_time)
-                        if not up_tok:
+                        if not up_tok or not down_tok:
                             continue
-                        # Sample the UP token's book; bid/ask are symmetric info
-                        # for the window (UP bid ≈ 1 - DOWN ask). One read per
-                        # asset/tf keeps load to 14 reads per cycle.
-                        bk = forensic_book(up_tok)
-                        _preentry_book_push(asset, tf, bk)
+                        # Sample BOTH sides so a DOWN bet sees its own book, not
+                        # the inverted UP side. Keyed by direction.
+                        _preentry_book_push(asset, tf, "UP", forensic_book(up_tok))
+                        _preentry_book_push(asset, tf, "DOWN", forensic_book(down_tok))
                     except Exception as e:
                         log.warning(f"[PREENTRY_BOOK] {asset} {tf}m sample failed (ignored): {e}")
         except Exception as e:
@@ -1730,6 +1732,9 @@ def forensic_oracle_lead(asset, binance_open, chainlink_open):
     bp = prices_binance.get(asset)
     cp = prices_chainlink.get(asset)
     if not bp or not cp or not binance_open or not chainlink_open:
+        # Log which input is missing so a persistent "—" can be diagnosed.
+        log.info(f"[ORACLE_LEAD] {asset} blank — bp={bp} cp={cp} "
+                 f"bin_open={binance_open} cl_open={chainlink_open}")
         return None
     if binance_open <= 0 or chainlink_open <= 0:
         return None
@@ -1821,9 +1826,10 @@ def build_forensic_snapshot(asset, tf, direction, hist, open_price, secs_left,
         "oracle_lead": forensic_oracle_lead(asset, binance_open, open_price),
         "majors": forensic_majors(direction),
         "book": forensic_book(token_id),
-        # Pre-entry book movement (the seconds BEFORE this entry), pulled from the
-        # continuous poller's rolling buffer. Empty list if poller is off/no data.
-        "preentry_book": get_preentry_book_series(asset, tf) if PREENTRY_BOOK_CAPTURE else [],
+        # Pre-entry book movement (the seconds BEFORE this entry) for THIS bet's
+        # own outcome side, pulled from the continuous poller's rolling buffer.
+        # Empty list if poller is off/no data.
+        "preentry_book": get_preentry_book_series(asset, tf, direction) if PREENTRY_BOOK_CAPTURE else [],
     }
     return snap
 
@@ -2211,6 +2217,13 @@ def process_tick():
 
             price_histories[ws_key].append(price)
             w = windows[ws_key]
+            # Robust binance_open: if it was None at window creation (Binance not
+            # yet warm that instant), backfill it the first moment Binance has a
+            # price for this asset. Without this, a window that opened a split-
+            # second before Binance data arrived would have oracle-lead blank for
+            # its whole life. Only sets it once (won't overwrite a real open).
+            if w.get("binance_open") in (None, 0) and prices_binance.get(asset):
+                w["binance_open"] = prices_binance.get(asset)
             pct = (price - w["open_price"]) / w["open_price"] * 100
             absp = abs(pct)
             dirn = "UP" if pct >= 0 else "DOWN"
