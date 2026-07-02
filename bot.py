@@ -1215,6 +1215,36 @@ def start_preentry_book_poller():
     log.info(f"[PREENTRY_BOOK] started (poll {PREENTRY_BOOK_POLL_SECS}s, keep {PREENTRY_BOOK_WINDOW}s)")
     return True
 
+# ── POST-FILL EXIT — LEVER 2 (off by default; SHADOW places NO orders) ───────
+# From fill to settlement a position currently rides unwatched: every loss is
+# the full -$5. The exit keeps watching AFTER the fill and, when the trade
+# turns, would sell into the bid instead of riding to zero.
+# Two triggers, either fires (one shot per clip):
+#   A) Binance recent move AGAINST the bet >= EXIT_BINANCE_REV_PCT, confirmed
+#      (if EXIT_CL_CONFIRM) by the Chainlink settlement feed being ACROSS the
+#      window open in the losing direction — same feed as the window open, so
+#      the comparison is basis-free.
+#   B) Own outcome's best bid < EXIT_BID_FLOOR_CENTS (book repriced hard — the
+#      "59¢ two seconds after fill" ETH case).
+# EXIT_MODE:
+#   off    — nothing runs (default)
+#   shadow — full watcher runs and logs "would have exited @X¢" in real time,
+#            plus a settlement scorecard (saved $ on losses / false-fire cost
+#            on wins). PLACES NO ORDERS. This is the tuning mode.
+#   live   — intentionally NOT armed in this build; falls back to shadow with
+#            a warning. Arm only after the shadow scorecard proves the config.
+EXIT_MODE              = os.environ.get("EXIT_MODE", "off").lower()
+EXIT_CHECK_SECS        = float(os.environ.get("EXIT_CHECK_SECS", "0.5"))
+EXIT_BINANCE_REV_PCT   = float(os.environ.get("EXIT_BINANCE_REV_PCT", "0.03"))
+EXIT_CL_CONFIRM        = os.environ.get("EXIT_CL_CONFIRM", "true").lower() == "true"
+EXIT_BID_FLOOR_CENTS   = float(os.environ.get("EXIT_BID_FLOOR_CENTS", "90.0"))
+EXIT_FINAL_CUTOFF_SECS = float(os.environ.get("EXIT_FINAL_CUTOFF_SECS", "2.0"))
+EXIT_BOOK_POLL_SECS    = float(os.environ.get("EXIT_BOOK_POLL_SECS", "1.0"))
+EXIT_SLIPPAGE_CENTS    = float(os.environ.get("EXIT_SLIPPAGE_CENTS", "2.0"))
+
+exit_watch = {}            # order_id -> position under post-fill watch
+exit_watch_lock = threading.Lock()
+
 # ── VARIANT: PER-ASSET 5m frontier — MEASURED from the probe /grid ───────────
 # Built from 682k+ settled windows (all 7 assets, both timeframes). The bands
 # below use the time-left ranges that had real sample counts (hundreds-to-
@@ -1593,6 +1623,11 @@ def maker_monitor():
                     if matched is not None:
                         if matched > info["matched"]:
                             info["matched"] = matched
+                            # ── LEVER-2: first fill puts the position under
+                            # post-fill exit watch (shadow logs only) ──
+                            if EXIT_MODE != "off" and not info.get("exit_watch_registered"):
+                                info["exit_watch_registered"] = True
+                                _exit_watch_register(info)
                             # ── VARIANT BAIL-OUT ──
                             # A fill came in. Check what we ACTUALLY paid. If the
                             # average fill price is below the bail-out floor, the
@@ -1625,6 +1660,128 @@ def start_maker_monitor():
         return False
     threading.Thread(target=maker_monitor, daemon=True).start()
     log.info(f"[MAKER] monitor started (bid {MAKER_BID_CENTS:.0f}¢ · cancel on {MAKER_CANCEL_REV_PCT}% Binance reversal)")
+    return True
+
+
+# ── LEVER-2 EXIT WATCH (shadow) ──────────────────────────────────────────────
+def _exit_watch_register(info):
+    """Put a just-filled clip under post-fill watch. Called from maker_monitor on
+    the first detected fill. Stores references only; fully fail-safe."""
+    try:
+        w = info["w"]
+        pos = dict(
+            order_id=info["order_id"], info=info, w=w,
+            asset=info["asset"], tf=info["tf"], direction=info["direction"],
+            token_id=info["token_id"], close_time=info["close_time"],
+            open_price=w.get("open_price"), entry_cents=info["price"] * 100,
+            last_book_poll=0.0, last_bid=None, fired=False,
+        )
+        with exit_watch_lock:
+            exit_watch[info["order_id"]] = pos
+        log.info(f"[EXIT:{EXIT_MODE}] watching {pos['asset']} {pos['tf']}m {pos['direction']} "
+                 f"(bin>={EXIT_BINANCE_REV_PCT}%{' +CL confirm' if EXIT_CL_CONFIRM else ''}, "
+                 f"bid floor {EXIT_BID_FLOOR_CENTS:.0f}¢)")
+    except Exception as e:
+        log.warning(f"[EXIT] register failed (ignored): {e}")
+
+
+def exit_watch_worker():
+    """Watches FILLED positions until EXIT_FINAL_CUTOFF_SECS before close.
+    SHADOW: on trigger, records the would-have-exit (price = current bid minus
+    EXIT_SLIPPAGE_CENTS) on the window for the settlement scorecard, sends a 👻
+    Telegram line, and stops watching that clip (one shot). NO ORDERS PLACED."""
+    while True:
+        try:
+            time.sleep(EXIT_CHECK_SECS)
+            if not exit_watch:
+                continue
+            now_dt = datetime.now(timezone.utc)
+            with exit_watch_lock:
+                items = list(exit_watch.values())
+            for pos in items:
+                oid = pos["order_id"]
+                secs_left = (pos["close_time"] - now_dt).total_seconds()
+                if pos["fired"] or secs_left <= EXIT_FINAL_CUTOFF_SECS:
+                    with exit_watch_lock:
+                        exit_watch.pop(oid, None)
+                    continue
+                asset, dirn = pos["asset"], pos["direction"]
+                trigger = None
+
+                # A) Binance turned against the bet; Chainlink confirms we're on
+                #    the losing side of the window open right now.
+                mv = binance_recent_move_pct(asset)
+                if mv is not None:
+                    against = (dirn == "UP" and mv <= -EXIT_BINANCE_REV_PCT) or \
+                              (dirn == "DOWN" and mv >= EXIT_BINANCE_REV_PCT)
+                    if against:
+                        confirmed = True
+                        if EXIT_CL_CONFIRM:
+                            cl = prices_chainlink.get(asset)
+                            op = pos.get("open_price")
+                            confirmed = bool(cl and op and (
+                                (dirn == "UP" and cl < op) or
+                                (dirn == "DOWN" and cl > op)))
+                        if confirmed:
+                            trigger = f"binance {mv:+.3f}% against" + \
+                                      (" · CL across open" if EXIT_CL_CONFIRM else "")
+
+                # B) own outcome's bid collapsed (throttled poll; open positions only)
+                now = time.time()
+                if now - pos["last_book_poll"] >= EXIT_BOOK_POLL_SECS:
+                    pos["last_book_poll"] = now
+                    try:
+                        pos["last_bid"] = get_position_value_cents(pos["token_id"])
+                    except Exception:
+                        pass
+                bid = pos.get("last_bid")
+                if trigger is None and bid is not None and bid < EXIT_BID_FLOOR_CENTS:
+                    trigger = f"own bid {bid:.0f}¢ < {EXIT_BID_FLOOR_CENTS:.0f}¢ floor"
+
+                if trigger is None:
+                    continue
+
+                # FIRE (one shot). Get a bid for pricing if we don't have one.
+                if bid is None:
+                    try:
+                        bid = get_position_value_cents(pos["token_id"])
+                    except Exception:
+                        bid = None
+                pos["fired"] = True
+                with exit_watch_lock:
+                    exit_watch.pop(oid, None)
+                shares = pos["info"].get("matched") or pos["info"].get("shares") or 0
+                exit_px = max(1.0, bid - EXIT_SLIPPAGE_CENTS) if bid is not None else None
+                ev = {
+                    "trigger": trigger, "bid": bid, "exit_price_cents": exit_px,
+                    "shares": shares, "entry_cents": pos["entry_cents"],
+                    "secs_left": round(secs_left, 1),
+                }
+                pos["w"].setdefault("shadow_exits", []).append(ev)
+                emoji = ASSET_EMOJI.get(asset, "")
+                px_s = f"{exit_px:.0f}¢" if exit_px is not None else "no bid (unexitable)"
+                log.info(f"[EXIT:{EXIT_MODE}] FIRE {asset} {pos['tf']}m {dirn} · {trigger} · "
+                         f"would sell @{px_s} · {secs_left:.0f}s left")
+                if EXIT_MODE == "shadow":
+                    tg(f"👻 <b>SHADOW EXIT · {emoji}{asset} {pos['tf']}m {dirn}</b>\n"
+                       f"{trigger}\nwould sell {shares:g}sh @ <b>{px_s}</b> · {secs_left:.0f}s left")
+                # live mode intentionally not armed in this build
+        except Exception as e:
+            log.error(f"[EXIT] worker error: {e}")
+
+
+def start_exit_watch():
+    global EXIT_MODE
+    if EXIT_MODE == "off":
+        log.info("[EXIT] disabled (EXIT_MODE=off)")
+        return False
+    if EXIT_MODE == "live":
+        log.warning("[EXIT] live mode NOT armed in this build — running SHADOW instead")
+        EXIT_MODE = "shadow"
+    threading.Thread(target=exit_watch_worker, daemon=True).start()
+    log.info(f"[EXIT] SHADOW watcher started (check {EXIT_CHECK_SECS}s · "
+             f"bin {EXIT_BINANCE_REV_PCT}% · bid floor {EXIT_BID_FLOOR_CENTS:.0f}¢ · "
+             f"active to T-{EXIT_FINAL_CUTOFF_SECS:.0f}s)")
     return True
 
 
@@ -2936,6 +3093,7 @@ def settle(w, asset, tf, close_price):
         "entry_vol_stats": w.get("entry_vol_stats"),
         "clip_snaps": w.get("clip_snaps", []),
         "clip_book_evo": w.get("clip_book_evo", []),
+        "shadow_exits": w.get("shadow_exits", []),
         "close_time": w.get("close_time"),
     }
     t = threading.Thread(target=_settle_worker, args=(settle_data, asset, tf), daemon=True)
@@ -3051,6 +3209,32 @@ def _settle_worker(d, asset, tf):
                     msg += "\n" + evo
             tg(msg)
 
+    # ── LEVER-2 SHADOW SCORECARD ──
+    # For every shadow-exit that fired in this window, show the counterfactual
+    # against the actual settlement: on a LOSS, "saved $X" (exit would have
+    # recovered that much); on a WIN, "false fire, cost $X" (the scratch it
+    # would have taken on a trade that won anyway). This is the tuning data.
+    sx = d.get("shadow_exits") or []
+    if sx:
+        sc_lines = []
+        for ev in sx:
+            sh = ev.get("shares") or 0
+            ec = ev.get("entry_cents") or 99.0
+            cost_e = sh * ec / 100.0
+            actual = (sh * 1.0 - cost_e) if won else -cost_e
+            px = ev.get("exit_price_cents")
+            if px is None:
+                sc_lines.append(f"• {ev['trigger']} → no bid, unexitable "
+                                f"(actual ${actual:+.2f})")
+                continue
+            would = sh * px / 100.0 - cost_e
+            diff = would - actual
+            tag = (f"saved ${diff:+.2f}" if not won
+                   else f"false fire, cost ${-diff:.2f}")
+            sc_lines.append(f"• {ev['trigger']} · would sell @{px:.0f}¢ → "
+                            f"${would:+.2f} vs actual ${actual:+.2f} ({tag})")
+        tg(f"👻 <b>SHADOW EXIT scorecard · {emoji}{asset} {tf}m</b>\n" + "\n".join(sc_lines))
+
     # Auto-pause after consecutive losses
     if not won and state["consecutive_losses"] >= CONFIG["consecutive_loss_limit"]:
         state["paused"] = True
@@ -3083,6 +3267,9 @@ def main():
 
     # Pre-entry book poller (off by default; continuous book sampling for all assets)
     start_preentry_book_poller()
+
+    # Lever-2 post-fill exit watch (off by default; shadow logs only, no orders)
+    start_exit_watch()
 
     mode_str = "🚨 SIGNALS-ONLY" if SIGNALS_ONLY_MODE else (
         f"🪧 MAKER - resting {MAKER_BID_CENTS:.0f}¢ bids" if maker_ok else "🤖 TAKER - FAK orders")
