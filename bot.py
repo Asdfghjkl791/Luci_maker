@@ -530,6 +530,28 @@ CHAINLINK_SYMBOLS = {
 }
 chainlink_last_update = {}  # Track when we last got a price for each asset
 
+# ── CHAINLINK PUSH MODE (off by default) ─────────────────────────────────────
+# Polymarket's RTDS docs say to send PING every 5 seconds to keep the connection
+# alive. The snapshot-and-reconnect workers below were built on the observation
+# that the feed goes silent after one snapshot — which may have been (or since
+# become) a missing-keepalive problem rather than true server behavior.
+# CL_PUSH_MODE=true replaces the 7 per-asset reconnect cycles with ONE persistent
+# connection subscribed to ALL symbols, pinging every CL_PUSH_PING_SECS and
+# consuming every tick as it arrives. If the server truly pushes, the settlement
+# feed goes from ~1-2s stale (reconnect cycle) to fresh-on-every-tick.
+# FAIL-SAFE + HONEST COST: if the stream goes silent for CL_PUSH_SILENT_SECS the
+# worker reconnects — but that means if the server really IS snapshot-only, push
+# mode is STALER than the old cycle (staleness sawtooths up to ~7s instead of
+# ~1-2s). So run this as a deliberate test: watch the [CL_PUSH] log lines.
+#   steady "ticks/min" counts   -> push works, keep it on
+#   repeated "silent...reconnecting" -> snapshot-only, set CL_PUSH_MODE=false
+CL_PUSH_MODE        = os.environ.get("CL_PUSH_MODE", "false").lower() == "true"
+CL_PUSH_PING_SECS   = float(os.environ.get("CL_PUSH_PING_SECS", "5.0"))
+CL_PUSH_SILENT_SECS = float(os.environ.get("CL_PUSH_SILENT_SECS", "6.0"))
+CL_PUSH_STATS_SECS  = float(os.environ.get("CL_PUSH_STATS_SECS", "60.0"))
+# Reverse map for routing the all-symbol stream: "btc/usd" -> "BTC"
+CHAINLINK_SYMBOL_TO_ASSET = {v: k for k, v in CHAINLINK_SYMBOLS.items()}
+
 
 def _extract_latest_value(payload):
     """Pull the newest price value out of a Chainlink payload (snapshot or single tick)."""
@@ -619,15 +641,129 @@ def chainlink_websocket_worker(asset):
         time.sleep(RECONNECT_INTERVAL)
 
 
+def _extract_push_tick(payload):
+    """Pull (symbol, value) out of a push-mode RTDS message payload. Handles both
+    the single-tick shape ({"symbol": "btc/usd", "value": ...}) and the snapshot
+    shape ({"data": [ ...ticks... ]}, newest last). Returns (None, None) if the
+    message carries no usable price."""
+    if not isinstance(payload, dict):
+        return None, None
+    sym = payload.get("symbol")
+    val = None
+    data_arr = payload.get("data")
+    if isinstance(data_arr, list) and data_arr:
+        latest = data_arr[-1]
+        if isinstance(latest, dict):
+            sym = latest.get("symbol") or sym
+            try:
+                v = float(latest.get("value", 0))
+                val = v if v > 0 else None
+            except (TypeError, ValueError):
+                val = None
+    if val is None and "value" in payload:
+        try:
+            v = float(payload.get("value", 0))
+            val = v if v > 0 else None
+        except (TypeError, ValueError):
+            val = None
+    return sym, val
+
+
+def chainlink_push_worker():
+    """PUSH MODE: one persistent RTDS connection for ALL symbols. Subscribes with
+    type "*" and an empty filter (per Polymarket's docs), sends a PING text
+    message every CL_PUSH_PING_SECS to keep the connection alive, and consumes
+    every tick as it arrives — updating prices_chainlink/chainlink_last_update
+    exactly like the per-asset workers, so nothing downstream changes.
+    Logs per-asset tick counts every CL_PUSH_STATS_SECS so the Railway logs SHOW
+    whether the server is truly pushing (steady ticks/min) or snapshot-only
+    (repeated silent-reconnect warnings -> flip CL_PUSH_MODE back to false)."""
+    stats = {a: 0 for a in ASSET_LIST}
+    last_stats = time.time()
+    while True:
+        ws = None
+        try:
+            ws = websocket.create_connection(CHAINLINK_WS_URL, timeout=10)
+            ws.settimeout(1)
+            ws.send(json.dumps({
+                "action": "subscribe",
+                "subscriptions": [
+                    {"topic": "crypto_prices_chainlink", "type": "*", "filters": ""}
+                ],
+            }))
+            log.info(f"[CL_PUSH] connected — persistent all-symbol stream, "
+                     f"PING every {CL_PUSH_PING_SECS:.0f}s")
+            last_ping = time.time()
+            last_data = time.time()
+            while True:
+                now = time.time()
+                if now - last_ping >= CL_PUSH_PING_SECS:
+                    last_ping = now
+                    ws.send("PING")
+                if now - last_data >= CL_PUSH_SILENT_SECS:
+                    log.warning(f"[CL_PUSH] no price data for {CL_PUSH_SILENT_SECS:.0f}s — "
+                                f"reconnecting (if this repeats, the server is snapshot-only: "
+                                f"set CL_PUSH_MODE=false)")
+                    break
+                try:
+                    msg = ws.recv()
+                except websocket.WebSocketTimeoutException:
+                    continue
+                if not msg:
+                    continue
+                if isinstance(msg, (bytes, bytearray)):
+                    try:
+                        msg = msg.decode()
+                    except Exception:
+                        continue
+                if msg.strip().upper() == "PONG":
+                    continue  # keepalive reply, not price data
+                try:
+                    data = json.loads(msg)
+                except Exception:
+                    continue
+                payload = data.get("payload", {}) if isinstance(data, dict) else {}
+                sym, value = _extract_push_tick(payload)
+                if value is None:
+                    continue
+                asset = CHAINLINK_SYMBOL_TO_ASSET.get(sym)
+                if not asset:
+                    continue
+                prices_chainlink[asset] = value
+                chainlink_last_update[asset] = time.time()
+                last_data = time.time()
+                stats[asset] += 1
+                if time.time() - last_stats >= CL_PUSH_STATS_SECS:
+                    log.info("[CL_PUSH] ticks/min  " +
+                             "  ".join(f"{a}={stats[a]}" for a in ASSET_LIST))
+                    stats = {a: 0 for a in ASSET_LIST}
+                    last_stats = time.time()
+        except Exception as e:
+            log.error(f"[CL_PUSH] connection error: {e} — reconnecting")
+        finally:
+            try:
+                if ws:
+                    ws.close()
+            except Exception:
+                pass
+        time.sleep(float(os.environ.get("CL_RECONNECT_SECS", "1.0")))
+
+
 def start_chainlink_threads():
-    """Start a background thread for each asset to maintain Chainlink WS connection."""
+    """Start the Chainlink feed. PUSH mode (CL_PUSH_MODE=true): one persistent
+    all-symbol connection with keepalive pings. Default (false): one snapshot-
+    and-reconnect thread per asset — the proven existing behavior, unchanged."""
     if not WEBSOCKET_AVAILABLE:
         log.warning("websocket-client not installed - Chainlink feed disabled")
         return False
+    if CL_PUSH_MODE:
+        threading.Thread(target=chainlink_push_worker, daemon=True).start()
+        log.info("[Chainlink WS] PUSH mode: 1 persistent all-symbol connection (CL_PUSH_MODE=true)")
+        return True
     for asset in ASSET_LIST:
         t = threading.Thread(target=chainlink_websocket_worker, args=(asset,), daemon=True)
         t.start()
-    log.info(f"[Chainlink WS] Started {len(ASSET_LIST)} background threads")
+    log.info(f"[Chainlink WS] Started {len(ASSET_LIST)} background threads (snapshot-reconnect mode)")
     return True
 
 
