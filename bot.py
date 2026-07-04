@@ -1255,6 +1255,7 @@ EXIT_DEBUG             = os.environ.get("EXIT_DEBUG", "false").lower() == "true"
 
 exit_watch = {}            # order_id -> position under post-fill watch
 exit_watch_lock = threading.Lock()
+_exit_notify = {"armed": False, "regfail": False}  # once-per-boot Telegram notices
 
 # ── VARIANT: PER-ASSET 5m frontier — MEASURED from the probe /grid ───────────
 # Built from 682k+ settled windows (all 7 assets, both timeframes). The bands
@@ -1556,6 +1557,12 @@ def _finalize_maker(info, reason):
             }
             db_id = db_insert_trade(trade)
             w["trade_db_id"] = db_id
+            # ── LEVER-2 double-net: guarantee every FILLED position is under
+            # exit watch even if the monitor-path hook was somehow missed
+            # (instant fills, partials finalized at close, branch surprises).
+            if EXIT_MODE != "off" and not info.get("exit_watch_registered"):
+                info["exit_watch_registered"] = True
+                _exit_watch_register(info)
             # Carry the book-evolution series (placement→fill) onto the window so
             # the settlement message can render it. Keyed per clip via a list.
             if info.get("book_evo"):
@@ -1693,8 +1700,16 @@ def _exit_watch_register(info):
         log.info(f"[EXIT:{EXIT_MODE}] watching {pos['asset']} {pos['tf']}m {pos['direction']} "
                  f"(bin>={EXIT_BINANCE_REV_PCT}%{' +CL confirm' if EXIT_CL_CONFIRM else ''}, "
                  f"bid floor {EXIT_BID_FLOOR_CENTS:.0f}¢)")
+        if not _exit_notify["armed"]:
+            _exit_notify["armed"] = True
+            tg(f"👻 shadow armed — watching its first position this boot "
+               f"({pos['asset']} {pos['tf']}m {pos['direction']})")
     except Exception as e:
-        log.warning(f"[EXIT] register failed (ignored): {e}")
+        log.error(f"[EXIT] register FAILED: {e}")
+        if not _exit_notify["regfail"]:
+            _exit_notify["regfail"] = True
+            tg(f"⚠️ shadow exit register FAILED: {e} — ghosts will not fire; "
+               f"send this to Fable")
 
 
 def exit_watch_worker():
@@ -1702,11 +1717,15 @@ def exit_watch_worker():
     SHADOW: on trigger, records the would-have-exit (price = current bid minus
     EXIT_SLIPPAGE_CENTS) on the window for the settlement scorecard, sends a 👻
     Telegram line, and stops watching that clip (one shot). NO ORDERS PLACED."""
+    hb_last = 0.0
     while True:
         try:
             time.sleep(EXIT_CHECK_SECS)
             if not exit_watch:
                 continue
+            if time.time() - hb_last >= 30:
+                hb_last = time.time()
+                log.info(f"[EXIT] watching {len(exit_watch)} position(s)")
             now_dt = datetime.now(timezone.utc)
             with exit_watch_lock:
                 items = list(exit_watch.values())
