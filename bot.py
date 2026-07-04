@@ -1241,6 +1241,17 @@ EXIT_BID_FLOOR_CENTS   = float(os.environ.get("EXIT_BID_FLOOR_CENTS", "90.0"))
 EXIT_FINAL_CUTOFF_SECS = float(os.environ.get("EXIT_FINAL_CUTOFF_SECS", "2.0"))
 EXIT_BOOK_POLL_SECS    = float(os.environ.get("EXIT_BOOK_POLL_SECS", "1.0"))
 EXIT_SLIPPAGE_CENTS    = float(os.environ.get("EXIT_SLIPPAGE_CENTS", "2.0"))
+# Trigger C — the settlement feed itself: if Chainlink (push mode, 0s stale, the
+# number the window actually settles on) sits ACROSS the window open in the
+# losing direction for EXIT_CL_LOSING_SECS straight, fire. Catches slow bleeds
+# that stay under the Binance 5s-window threshold, and works when Binance has a
+# gap or the book endpoint is failing. Epsilon avoids firing on a hair's-width
+# oscillation right at the open.
+EXIT_CL_LOSING_SECS    = float(os.environ.get("EXIT_CL_LOSING_SECS", "3.0"))
+EXIT_CL_EPSILON_PCT    = float(os.environ.get("EXIT_CL_EPSILON_PCT", "0.005"))
+# EXIT_DEBUG=true logs each watched position's state every ~5s (binance move,
+# CL vs open, own bid) so a silent watcher is always diagnosable.
+EXIT_DEBUG             = os.environ.get("EXIT_DEBUG", "false").lower() == "true"
 
 exit_watch = {}            # order_id -> position under post-fill watch
 exit_watch_lock = threading.Lock()
@@ -1675,6 +1686,7 @@ def _exit_watch_register(info):
             token_id=info["token_id"], close_time=info["close_time"],
             open_price=w.get("open_price"), entry_cents=info["price"] * 100,
             last_book_poll=0.0, last_bid=None, fired=False,
+            cl_losing_since=None, last_dbg=0.0,
         )
         with exit_watch_lock:
             exit_watch[info["order_id"]] = pos
@@ -1726,8 +1738,29 @@ def exit_watch_worker():
                             trigger = f"binance {mv:+.3f}% against" + \
                                       (" · CL across open" if EXIT_CL_CONFIRM else "")
 
-                # B) own outcome's bid collapsed (throttled poll; open positions only)
+                # C) the settlement feed itself: Chainlink across the window
+                #    open in the losing direction for EXIT_CL_LOSING_SECS
+                #    straight. Catches slow bleeds trigger A can't see, and
+                #    doesn't depend on Binance or the book endpoint.
                 now = time.time()
+                cl = prices_chainlink.get(asset)
+                op = pos.get("open_price")
+                if trigger is None and cl and op:
+                    eps = op * EXIT_CL_EPSILON_PCT / 100.0
+                    losing = (dirn == "UP" and cl < op - eps) or \
+                             (dirn == "DOWN" and cl > op + eps)
+                    if losing:
+                        if pos["cl_losing_since"] is None:
+                            pos["cl_losing_since"] = now
+                        elif now - pos["cl_losing_since"] >= EXIT_CL_LOSING_SECS:
+                            dur = now - pos["cl_losing_since"]
+                            cl_move = (cl - op) / op * 100.0
+                            trigger = (f"settlement feed {cl_move:+.3f}% across open "
+                                       f"for {dur:.0f}s")
+                    else:
+                        pos["cl_losing_since"] = None
+
+                # B) own outcome's bid collapsed (throttled poll; open positions only)
                 if now - pos["last_book_poll"] >= EXIT_BOOK_POLL_SECS:
                     pos["last_book_poll"] = now
                     try:
@@ -1737,6 +1770,13 @@ def exit_watch_worker():
                 bid = pos.get("last_bid")
                 if trigger is None and bid is not None and bid < EXIT_BID_FLOOR_CENTS:
                     trigger = f"own bid {bid:.0f}¢ < {EXIT_BID_FLOOR_CENTS:.0f}¢ floor"
+
+                if EXIT_DEBUG and now - pos["last_dbg"] >= 5.0:
+                    pos["last_dbg"] = now
+                    cl_s = f"{(cl - op) / op * 100:+.3f}%" if (cl and op) else "—"
+                    log.info(f"[EXIT_DBG] {asset} {pos['tf']}m {dirn} · {secs_left:.0f}s left · "
+                             f"bin={mv if mv is not None else '—'} · CLvsOpen={cl_s} · "
+                             f"bid={bid if bid is not None else '—'}")
 
                 if trigger is None:
                     continue
