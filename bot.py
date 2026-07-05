@@ -224,6 +224,43 @@ def best_ask_cents(token_id):
         return None
 
 
+
+def fetch_polymarket_outcome(asset, tf, open_ts):
+    """Read the ACTUAL settled outcome from Polymarket (Chainlink-resolved), same
+    method the maker bot uses. Returns 'UP', 'DOWN', 'TIE', or None (not settled
+    yet / error). No price inference — this is the real market resolution, so the
+    fake-tie-from-stale-feed problem disappears."""
+    slug = f"{asset.lower()}-updown-{tf}m-{open_ts}"
+    try:
+        r = requests.get(f"{GAMMA_BASE}/events", params={"slug": slug}, timeout=10)
+        data = r.json()
+        if not data or not isinstance(data, list):
+            return None
+        markets = data[0].get("markets", [])
+        if not markets:
+            return None
+        op = markets[0].get("outcomePrices")
+        if isinstance(op, str):
+            try:
+                op = json.loads(op)
+            except Exception:
+                pass
+        if not op or len(op) < 2:
+            return None
+        up_p, down_p = float(op[0]), float(op[1])
+        if up_p >= 0.99:
+            return "UP"
+        if down_p >= 0.99:
+            return "DOWN"
+        # both ~0.5 after settle would be a genuine tie/refund; still-live = None
+        if abs(up_p - 0.5) < 0.01 and abs(down_p - 0.5) < 0.01:
+            return "TIE"
+        return None
+    except Exception as e:
+        log.debug(f"[OUTCOME] {slug}: {e}")
+        return None
+
+
 # ── WINDOW TIMING ────────────────────────────────────────────────────────────
 def window_times(tf):
     now = int(time.time())
@@ -408,33 +445,34 @@ def scorer():
             for s in items:
                 if now < s["close_ts"] + 2:
                     continue
-                settle = prices_ref.get(s["asset"])
-                if settle is None:
-                    with pending_lock:
-                        s in pending and pending.remove(s)
-                    db_resolve(s["rid"], None, "VOID", 0)
-                    continue
-                went_up = settle > s["open_price"]
-                if abs(settle - s["open_price"]) < 1e-9:
+                # Grade against the REAL Polymarket settled outcome. Retry for a
+                # while after close since resolution lags a few seconds; only give
+                # up (VOID) after a generous window.
+                outcome = fetch_polymarket_outcome(s["asset"], s["tf"], s["open_ts"])
+                if outcome is None:
+                    if now > s["close_ts"] + 180:
+                        db_resolve(s["rid"], None, "VOID", 0)
+                        with pending_lock:
+                            s in pending and pending.remove(s)
+                    continue  # not settled yet — check again next pass
+                if outcome == "TIE":
                     result, pnl = "TIE", 0.0
                 else:
-                    won = (s["direction"] == "UP") == went_up
-                    # TAKER economics: pay ask cents, win pays 100¢.
+                    won = (s["direction"] == outcome)
                     shares = PAPER_STAKE / (s["ask"] / 100.0)
                     pnl = (shares * 1.0 - PAPER_STAKE) if won else -PAPER_STAKE
                     result = "WIN" if won else "LOSS"
-                db_resolve(s["rid"], settle, result, round(pnl, 4))
+                db_resolve(s["rid"], None, result, round(pnl, 4))
                 with pending_lock:
                     s in pending and pending.remove(s)
                 sb = db_scoreboard()
-                emoji = "✅" if result == "WIN" else ("❌" if result == "LOSS" else "➖")
-                wr = f"{sb['wr']:.1f}%" if sb["wr"] is not None else "—"
+                emoji = "\u2705" if result == "WIN" else ("\u274c" if result == "LOSS" else "\u2796")
+                wr = f"{sb['wr']:.1f}%" if sb["wr"] is not None else "\u2014"
                 tg(f"{emoji} PAPER {ASSET_EMOJI.get(s['asset'],'')}{s['asset']} "
                    f"{s['tf']}m {s['direction']} <b>{result}</b> ${pnl:+.2f}\n"
-                   f"📄 {sb['n']} trades · {wr} (BE {sb['be']:.1f}%) · P&L ${sb['pnl']:+.2f}")
+                   f"\U0001f4c4 {sb['n']} trades \u00b7 {wr} (BE {sb['be']:.1f}%) \u00b7 P&L ${sb['pnl']:+.2f}")
         except Exception as e:
             log.error(f"[SCORER] {e}")
-
 
 def main():
     if not WEBSOCKET_AVAILABLE:
