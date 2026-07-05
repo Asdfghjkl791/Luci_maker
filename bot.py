@@ -64,18 +64,20 @@ ASSET_LIST = ["BTC", "ETH", "SOL", "DOGE", "BNB", "XRP", "HYPE"]
 ASSET_EMOJI = {"BTC": "🟠", "ETH": "🔷", "SOL": "🟣", "DOGE": "🟡",
                "BNB": "🟨", "XRP": "⚪", "HYPE": "🟢"}
 
-# ── EXACT GATE, copied verbatim from bot_variant_MEASURED.py (the MEASURED gate,
-#    both 5m and 15m from the probe grid — the stricter, better-performing gate) ─
-PER_ASSET_FRONTIER = {
-    "BTC":  [(10, 0.05), (20, 0.10), (40, 0.10), (70, 0.20), (120, 0.40)],
-    "ETH":  [(10, 0.05), (20, 0.10), (40, 0.20), (70, 0.40), (120, 0.40)],
-    "SOL":  [(10, 0.10), (20, 0.20), (40, 0.40), (70, 0.40), (120, 0.40)],
-    "XRP":  [(10, 0.05), (20, 0.10), (40, 0.10), (70, 0.20), (120, 0.40)],
-    "DOGE": [(10, 0.05), (20, 0.10), (40, 0.10), (70, 0.20), (120, 0.40)],
-    "BNB":  [(10, 0.05), (20, 0.10), (40, 0.10), (70, 0.20), (120, 0.40)],
-    "HYPE": [(10, 0.10), (20, 0.20), (40, 0.40), (70, 0.40), (120, 0.40)],
+# ── GATE: guessed 5m table (from bot_variant.py) + measured 15m table (from
+#    bot_variant_MEASURED.py). This is the config you asked to paper-test:
+#    your real guessed 5-minute strategy, paired with the probe-MEASURED 15m
+#    surface (more defensible than the guessed scaling rule for 15m). ──
+PER_ASSET_FRONTIER = {          # 5m — GUESSED (matches live bot_variant.py)
+    "BTC":  [(20, 0.025), (40, 0.04), (70, 0.08), (120, 0.15)],
+    "ETH":  [(20, 0.03), (40, 0.07), (70, 0.11), (120, 0.16)],
+    "XRP":  [(20, 0.04), (40, 0.10), (70, 0.15), (120, 0.23)],
+    "DOGE": [(20, 0.05), (40, 0.10), (70, 0.15), (120, 0.22)],
+    "BNB":  [(20, 0.04), (40, 0.10), (70, 0.17), (120, 0.20)],
+    "SOL":  [(20, 0.10), (40, 0.17), (70, 0.21), (120, 0.27)],
+    "HYPE": [(20, 0.16), (40, 0.20), (70, 0.24), (120, 0.30)],
 }
-PER_ASSET_FRONTIER_15M = {
+PER_ASSET_FRONTIER_15M = {      # 15m — MEASURED (from the probe grid)
     "BTC":  [(10, 0.05), (20, 0.10), (40, 0.10), (70, 0.10), (120, 0.10)],
     "ETH":  [(10, 0.05), (20, 0.10), (40, 0.20), (70, 0.40), (120, 0.40)],
     "SOL":  [(10, 0.10), (20, 0.10), (40, 0.20), (70, 0.40), (120, 0.40)],
@@ -84,9 +86,11 @@ PER_ASSET_FRONTIER_15M = {
     "BNB":  [(10, 0.05), (20, 0.10), (40, 0.20), (70, 0.20), (120, 0.20)],
     "HYPE": [(10, 0.05), (20, 0.10), (40, 0.20), (70, 0.40), (120, 0.40)],
 }
-GLOBAL_FRONTIER = [(10, 0.05), (20, 0.10), (40, 0.20), (70, 0.40), (120, 0.40)]
+# 5m fallback mirrors the guessed bot's global gate; 15m falls back to its table.
+GLOBAL_FRONTIER = [(3, 0.02), (40, 0.10), (70, 0.20), (120, 0.40)]
+GLOBAL_FRONTIER_15M = [(10, 0.05), (20, 0.10), (40, 0.20), (70, 0.40), (120, 0.40)]
 FRONTIER_FALLBACK_PCT = float(os.environ.get("FRONTIER_FALLBACK_PCT", "0.40"))
-HYPE_MIN_MOVE_PCT = float(os.environ.get("HYPE_MIN_MOVE_PCT", "0.0"))
+HYPE_MIN_MOVE_PCT = float(os.environ.get("HYPE_MIN_MOVE_PCT", "0.16"))
 
 
 def _frontier_lookup(bands, secs_left):
@@ -100,12 +104,12 @@ def frontier_locked(asset, abs_move_pct, secs_left, tf=5):
     if secs_left <= 0:
         return False
     if tf == 15:
-        bands = PER_ASSET_FRONTIER_15M.get(asset, GLOBAL_FRONTIER)
+        bands = PER_ASSET_FRONTIER_15M.get(asset, GLOBAL_FRONTIER_15M)
     else:
         bands = PER_ASSET_FRONTIER.get(asset, GLOBAL_FRONTIER)
     need = _frontier_lookup(bands, secs_left)
-    if asset == "HYPE" and HYPE_MIN_MOVE_PCT > 0:
-        need = max(need, HYPE_MIN_MOVE_PCT)
+    if asset == "HYPE" and tf != 15:
+        need = max(need, HYPE_MIN_MOVE_PCT)   # guessed-5m HYPE floor only
     return abs_move_pct >= need
 
 
