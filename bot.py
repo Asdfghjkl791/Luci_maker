@@ -64,46 +64,47 @@ ASSET_LIST = ["BTC", "ETH", "SOL", "DOGE", "BNB", "XRP", "HYPE"]
 ASSET_EMOJI = {"BTC": "🟠", "ETH": "🔷", "SOL": "🟣", "DOGE": "🟡",
                "BNB": "🟨", "XRP": "⚪", "HYPE": "🟢"}
 
-# ── EXACT GATE, copied verbatim from bot_variant.py (the guessed gate) ────────
+# ── EXACT GATE, copied verbatim from bot_variant_MEASURED.py (the MEASURED gate,
+#    both 5m and 15m from the probe grid — the stricter, better-performing gate) ─
 PER_ASSET_FRONTIER = {
-    "BTC":  [(20, 0.025), (40, 0.04), (70, 0.08), (120, 0.15)],
-    "ETH":  [(20, 0.03), (40, 0.07), (70, 0.11), (120, 0.16)],
-    "XRP":  [(20, 0.04), (40, 0.10), (70, 0.15), (120, 0.23)],
-    "DOGE": [(20, 0.05), (40, 0.10), (70, 0.15), (120, 0.22)],
-    "BNB":  [(20, 0.04), (40, 0.10), (70, 0.17), (120, 0.20)],
-    "SOL":  [(20, 0.10), (40, 0.17), (70, 0.21), (120, 0.27)],
-    "HYPE": [(20, 0.16), (40, 0.20), (70, 0.24), (120, 0.30)],
+    "BTC":  [(10, 0.05), (20, 0.10), (40, 0.10), (70, 0.20), (120, 0.40)],
+    "ETH":  [(10, 0.05), (20, 0.10), (40, 0.20), (70, 0.40), (120, 0.40)],
+    "SOL":  [(10, 0.10), (20, 0.20), (40, 0.40), (70, 0.40), (120, 0.40)],
+    "XRP":  [(10, 0.05), (20, 0.10), (40, 0.10), (70, 0.20), (120, 0.40)],
+    "DOGE": [(10, 0.05), (20, 0.10), (40, 0.10), (70, 0.20), (120, 0.40)],
+    "BNB":  [(10, 0.05), (20, 0.10), (40, 0.10), (70, 0.20), (120, 0.40)],
+    "HYPE": [(10, 0.10), (20, 0.20), (40, 0.40), (70, 0.40), (120, 0.40)],
 }
-GLOBAL_FRONTIER = [(3, 0.02), (40, 0.10), (70, 0.20), (120, 0.40)]
+PER_ASSET_FRONTIER_15M = {
+    "BTC":  [(10, 0.05), (20, 0.10), (40, 0.10), (70, 0.10), (120, 0.10)],
+    "ETH":  [(10, 0.05), (20, 0.10), (40, 0.20), (70, 0.40), (120, 0.40)],
+    "SOL":  [(10, 0.10), (20, 0.10), (40, 0.20), (70, 0.40), (120, 0.40)],
+    "XRP":  [(10, 0.05), (20, 0.10), (40, 0.10), (70, 0.10), (120, 0.20)],
+    "DOGE": [(10, 0.05), (20, 0.10), (40, 0.20), (70, 0.20), (120, 0.20)],
+    "BNB":  [(10, 0.05), (20, 0.10), (40, 0.20), (70, 0.20), (120, 0.20)],
+    "HYPE": [(10, 0.05), (20, 0.10), (40, 0.20), (70, 0.40), (120, 0.40)],
+}
+GLOBAL_FRONTIER = [(10, 0.05), (20, 0.10), (40, 0.20), (70, 0.40), (120, 0.40)]
 FRONTIER_FALLBACK_PCT = float(os.environ.get("FRONTIER_FALLBACK_PCT", "0.40"))
-HYPE_MIN_MOVE_PCT = float(os.environ.get("HYPE_MIN_MOVE_PCT", "0.16"))
+HYPE_MIN_MOVE_PCT = float(os.environ.get("HYPE_MIN_MOVE_PCT", "0.0"))
 
 
-def _frontier_15m(asset, secs_left):
-    bands = PER_ASSET_FRONTIER.get(asset, GLOBAL_FRONTIER)
-    base = bands[2][1] if len(bands) >= 3 else bands[-1][1]
-    if secs_left <= 20:
-        return base * 1.3
-    if secs_left <= 70:
-        return base * 1.8
-    if secs_left <= 180:
-        return base * 2.3
-    return base * 3.0
+def _frontier_lookup(bands, secs_left):
+    for max_secs, min_move in bands:
+        if secs_left <= max_secs:
+            return min_move
+    return FRONTIER_FALLBACK_PCT
 
 
 def frontier_locked(asset, abs_move_pct, secs_left, tf=5):
     if secs_left <= 0:
         return False
     if tf == 15:
-        need = _frontier_15m(asset, secs_left)
+        bands = PER_ASSET_FRONTIER_15M.get(asset, GLOBAL_FRONTIER)
     else:
         bands = PER_ASSET_FRONTIER.get(asset, GLOBAL_FRONTIER)
-        need = FRONTIER_FALLBACK_PCT
-        for max_secs, min_move in bands:
-            if secs_left <= max_secs:
-                need = min_move
-                break
-    if asset == "HYPE":
+    need = _frontier_lookup(bands, secs_left)
+    if asset == "HYPE" and HYPE_MIN_MOVE_PCT > 0:
         need = max(need, HYPE_MIN_MOVE_PCT)
     return abs_move_pct >= need
 
