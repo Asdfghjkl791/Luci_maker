@@ -420,7 +420,8 @@ def engine():
                                     secs_left, move, ask, op)
                     with pending_lock:
                         pending.append({"rid": rid, "asset": asset, "tf": tf,
-                                        "direction": direction, "close_ts": close_ts,
+                                        "direction": direction, "open_ts": open_ts,
+                                        "close_ts": close_ts,
                                         "open_price": op, "ask": ask})
                     if SEND_EACH:
                         arrow = "⬆️" if direction == "UP" else "⬇️"
