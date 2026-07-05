@@ -50,6 +50,12 @@ TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 PAPER_STAKE      = float(os.environ.get("PAPER_STAKE", "5"))
 TAKER_MAX_ASK_CENTS = float(os.environ.get("TAKER_MAX_ASK_CENTS", "99.5"))
+# Floor: skip entries CHEAPER than this — the market pricing an outcome below
+# this is telling you it's too uncertain (the 89¢ coin-flip that lost). Note:
+# tightening the band [MIN, MAX] does NOT create an edge — inside the band, win
+# rate still ≈ price paid. It only stops the bot taking obviously-uncertain
+# trades. Default 0 = no floor (take anything up to the ceiling).
+TAKER_MIN_ASK_CENTS = float(os.environ.get("TAKER_MIN_ASK_CENTS", "0"))
 DB_PATH          = os.environ.get("DB_PATH", "paper_taker.db")
 SEND_EACH        = os.environ.get("SEND_EACH", "true").lower() == "true"
 TFS              = [int(x) for x in os.environ.get("TIMEFRAMES", "5").split(",")]
@@ -356,13 +362,16 @@ def engine():
                     if ask is None:
                         continue
                     fired.add(wkey)
-                    if ask > TAKER_MAX_ASK_CENTS:
-                        # would-be trade, but ask too high → record as skipped-costly
+                    if ask > TAKER_MAX_ASK_CENTS or ask < TAKER_MIN_ASK_CENTS:
+                        # outside the accepted band — record why and skip
+                        why = ("too high" if ask > TAKER_MAX_ASK_CENTS
+                               else "too uncertain")
                         log.info(f"[PAPER] {asset} {tf}m {direction} gate fired but "
-                                 f"ask {ask:.1f}¢ > {TAKER_MAX_ASK_CENTS:.0f}¢ — skip")
+                                 f"ask {ask:.1f}¢ {why} "
+                                 f"(band {TAKER_MIN_ASK_CENTS:.0f}-{TAKER_MAX_ASK_CENTS:.0f}¢) — skip")
                         if SEND_EACH:
                             tg(f"⚪ PAPER skip {ASSET_EMOJI.get(asset,'')}{asset} {tf}m "
-                               f"{direction} · ask {ask:.1f}¢ too high ({absmove:.3f}% "
+                               f"{direction} · ask {ask:.1f}¢ {why} ({absmove:.3f}% "
                                f"@{secs_left:.0f}s)")
                         continue
                     rid = db_insert(asset, tf, direction, open_ts, close_ts,
