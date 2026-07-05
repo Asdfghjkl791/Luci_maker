@@ -58,6 +58,13 @@ TAKER_MAX_ASK_CENTS = float(os.environ.get("TAKER_MAX_ASK_CENTS", "99.5"))
 TAKER_MIN_ASK_CENTS = float(os.environ.get("TAKER_MIN_ASK_CENTS", "0"))
 DB_PATH          = os.environ.get("DB_PATH", "paper_taker.db")
 SEND_EACH        = os.environ.get("SEND_EACH", "true").lower() == "true"
+# Fast grading: grade instantly off the reference feed at window close (~1s),
+# then confirm against real Polymarket settlement when it lands and correct any
+# disagreement. FAST_GRADE=true gives ~1s results; false uses settlement-only
+# (accurate but 1-3 min). Epsilon: a window only provisionally ties if |move| is
+# below this (in %), else it grades UP/DOWN immediately.
+FAST_GRADE       = os.environ.get("FAST_GRADE", "true").lower() == "true"
+FAST_TIE_EPS_PCT = float(os.environ.get("FAST_TIE_EPS_PCT", "0.0005"))
 TFS              = [int(x) for x in os.environ.get("TIMEFRAMES", "5").split(",")]
 
 ASSET_LIST = ["BTC", "ETH", "SOL", "DOGE", "BNB", "XRP", "HYPE"]
@@ -235,9 +242,12 @@ def fetch_polymarket_outcome(asset, tf, open_ts):
         r = requests.get(f"{GAMMA_BASE}/events", params={"slug": slug}, timeout=10)
         data = r.json()
         if not data or not isinstance(data, list):
+            log.info(f"[OUTCOME] {slug}: no event (resp type {type(data).__name__}, "
+                     f"len {len(data) if hasattr(data,'__len__') else '?'})")
             return None
         markets = data[0].get("markets", [])
         if not markets:
+            log.info(f"[OUTCOME] {slug}: event found but no markets")
             return None
         op = markets[0].get("outcomePrices")
         if isinstance(op, str):
@@ -246,18 +256,22 @@ def fetch_polymarket_outcome(asset, tf, open_ts):
             except Exception:
                 pass
         if not op or len(op) < 2:
+            log.info(f"[OUTCOME] {slug}: no outcomePrices yet (raw={op})")
             return None
         up_p, down_p = float(op[0]), float(op[1])
         if up_p >= 0.99:
+            log.info(f"[OUTCOME] {slug}: settled UP {op}")
             return "UP"
         if down_p >= 0.99:
+            log.info(f"[OUTCOME] {slug}: settled DOWN {op}")
             return "DOWN"
-        # both ~0.5 after settle would be a genuine tie/refund; still-live = None
         if abs(up_p - 0.5) < 0.01 and abs(down_p - 0.5) < 0.01:
+            log.info(f"[OUTCOME] {slug}: TIE {op}")
             return "TIE"
+        log.info(f"[OUTCOME] {slug}: not settled yet (prices {op})")
         return None
     except Exception as e:
-        log.debug(f"[OUTCOME] {slug}: {e}")
+        log.warning(f"[OUTCOME] {slug}: ERROR {e}")
         return None
 
 
@@ -437,6 +451,11 @@ def engine():
 
 
 def scorer():
+    """Two-tier grading. TIER 1 (fast, ~1s): at window close, grade off the
+    reference feed and post immediately, tagged with a lightning bolt. TIER 2
+    (confirm, 1-3 min): when Polymarket publishes the real settlement, check it;
+    if it disagrees, post a correction and fix the DB. ~1s feedback that
+    self-corrects to ground truth."""
     while True:
         try:
             time.sleep(0.5)
@@ -444,34 +463,72 @@ def scorer():
             with pending_lock:
                 items = list(pending)
             for s in items:
-                if now < s["close_ts"] + 2:
+                if now < s["close_ts"]:
                     continue
-                # Grade against the REAL Polymarket settled outcome. Retry for a
-                # while after close since resolution lags a few seconds; only give
-                # up (VOID) after a generous window.
+
+                # TIER 1: fast provisional grade off the feed (once)
+                if FAST_GRADE and not s.get("fast_done"):
+                    settle = prices_ref.get(s["asset"])
+                    op = s["open_price"]
+                    if settle is None:
+                        if now > s["close_ts"] + 20:
+                            s["fast_done"] = True
+                        continue
+                    s["fast_done"] = True
+                    move = (settle - op) / op * 100.0
+                    if abs(move) < FAST_TIE_EPS_PCT:
+                        result, pnl = "TIE", 0.0
+                    else:
+                        won = (s["direction"] == ("UP" if move > 0 else "DOWN"))
+                        shares = PAPER_STAKE / (s["ask"] / 100.0)
+                        pnl = (shares * 1.0 - PAPER_STAKE) if won else -PAPER_STAKE
+                        result = "WIN" if won else "LOSS"
+                    s["fast_result"] = result
+                    db_resolve(s["rid"], None, result, round(pnl, 4))
+                    sb = db_scoreboard()
+                    emoji = "\u2705" if result == "WIN" else ("\u274c" if result == "LOSS" else "\u2796")
+                    wr = f"{sb['wr']:.1f}%" if sb["wr"] is not None else "\u2014"
+                    tg(f"{emoji}\u26a1 PAPER {ASSET_EMOJI.get(s['asset'],'')}{s['asset']} "
+                       f"{s['tf']}m {s['direction']} <b>{result}</b> ${pnl:+.2f}\n"
+                       f"\U0001f4c4 {sb['n']} trades \u00b7 {wr} (BE {sb['be']:.1f}%) \u00b7 P&L ${sb['pnl']:+.2f}")
+
+                # TIER 2: confirm against real Polymarket settlement
+                lastck = s.get("last_outcome_check", 0)
+                if now - lastck < 15:
+                    continue
+                s["last_outcome_check"] = now
                 outcome = fetch_polymarket_outcome(s["asset"], s["tf"], s["open_ts"])
                 if outcome is None:
-                    if now > s["close_ts"] + 180:
-                        db_resolve(s["rid"], None, "VOID", 0)
+                    if now > s["close_ts"] + 600:
+                        if not s.get("fast_done"):
+                            db_resolve(s["rid"], None, "VOID", 0)
+                        log.warning(f"[SCORER] no settlement after 10min {s['asset']} {s['tf']}m")
                         with pending_lock:
                             s in pending and pending.remove(s)
-                    continue  # not settled yet — check again next pass
+                    continue
                 if outcome == "TIE":
-                    result, pnl = "TIE", 0.0
+                    true_result, true_pnl = "TIE", 0.0
                 else:
                     won = (s["direction"] == outcome)
                     shares = PAPER_STAKE / (s["ask"] / 100.0)
-                    pnl = (shares * 1.0 - PAPER_STAKE) if won else -PAPER_STAKE
-                    result = "WIN" if won else "LOSS"
-                db_resolve(s["rid"], None, result, round(pnl, 4))
+                    true_pnl = (shares * 1.0 - PAPER_STAKE) if won else -PAPER_STAKE
+                    true_result = "WIN" if won else "LOSS"
+                if s.get("fast_done") and s.get("fast_result") != true_result:
+                    db_resolve(s["rid"], None, true_result, round(true_pnl, 4))
+                    tg(f"\U0001f527 CORRECTION {ASSET_EMOJI.get(s['asset'],'')}{s['asset']} "
+                       f"{s['tf']}m {s['direction']}: fast said {s.get('fast_result')}, "
+                       f"settlement says <b>{true_result}</b> \u2014 scoreboard fixed")
+                    log.info(f"[SCORER] corrected {s['asset']} {s['tf']}m {s.get('fast_result')}->{true_result}")
+                elif not s.get("fast_done"):
+                    db_resolve(s["rid"], None, true_result, round(true_pnl, 4))
+                    sb = db_scoreboard()
+                    emoji = "\u2705" if true_result == "WIN" else ("\u274c" if true_result == "LOSS" else "\u2796")
+                    wr = f"{sb['wr']:.1f}%" if sb["wr"] is not None else "\u2014"
+                    tg(f"{emoji} PAPER {ASSET_EMOJI.get(s['asset'],'')}{s['asset']} "
+                       f"{s['tf']}m {s['direction']} <b>{true_result}</b> ${true_pnl:+.2f}\n"
+                       f"\U0001f4c4 {sb['n']} trades \u00b7 {wr} (BE {sb['be']:.1f}%) \u00b7 P&L ${sb['pnl']:+.2f}")
                 with pending_lock:
                     s in pending and pending.remove(s)
-                sb = db_scoreboard()
-                emoji = "\u2705" if result == "WIN" else ("\u274c" if result == "LOSS" else "\u2796")
-                wr = f"{sb['wr']:.1f}%" if sb["wr"] is not None else "\u2014"
-                tg(f"{emoji} PAPER {ASSET_EMOJI.get(s['asset'],'')}{s['asset']} "
-                   f"{s['tf']}m {s['direction']} <b>{result}</b> ${pnl:+.2f}\n"
-                   f"\U0001f4c4 {sb['n']} trades \u00b7 {wr} (BE {sb['be']:.1f}%) \u00b7 P&L ${sb['pnl']:+.2f}")
         except Exception as e:
             log.error(f"[SCORER] {e}")
 
