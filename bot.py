@@ -265,9 +265,8 @@ def fetch_polymarket_outcome(asset, tf, open_ts):
         if down_p >= 0.99:
             log.info(f"[OUTCOME] {slug}: settled DOWN {op}")
             return "DOWN"
-        if abs(up_p - 0.5) < 0.01 and abs(down_p - 0.5) < 0.01:
-            log.info(f"[OUTCOME] {slug}: TIE {op}")
-            return "TIE"
+        # Anything else — including ~[0.5,0.5] — is NOT settled yet (Up/Down
+        # markets sit near 50/50 before Chainlink resolves). Never a tie; wait.
         log.info(f"[OUTCOME] {slug}: not settled yet (prices {op})")
         return None
     except Exception as e:
@@ -477,12 +476,16 @@ def scorer():
                     s["fast_done"] = True
                     move = (settle - op) / op * 100.0
                     if abs(move) < FAST_TIE_EPS_PCT:
-                        result, pnl = "TIE", 0.0
-                    else:
-                        won = (s["direction"] == ("UP" if move > 0 else "DOWN"))
-                        shares = PAPER_STAKE / (s["ask"] / 100.0)
-                        pnl = (shares * 1.0 - PAPER_STAKE) if won else -PAPER_STAKE
-                        result = "WIN" if won else "LOSS"
+                        # essentially no move — don't fast-grade; wait for the
+                        # real settlement to decide (avoids fake ties).
+                        s["fast_done"] = False
+                        if now > s["close_ts"] + 20:
+                            s["fast_skip"] = True
+                        continue
+                    won = (s["direction"] == ("UP" if move > 0 else "DOWN"))
+                    shares = PAPER_STAKE / (s["ask"] / 100.0)
+                    pnl = (shares * 1.0 - PAPER_STAKE) if won else -PAPER_STAKE
+                    result = "WIN" if won else "LOSS"
                     s["fast_result"] = result
                     db_resolve(s["rid"], None, result, round(pnl, 4))
                     sb = db_scoreboard()
