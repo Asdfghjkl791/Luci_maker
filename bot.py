@@ -65,6 +65,14 @@ SEND_EACH        = os.environ.get("SEND_EACH", "true").lower() == "true"
 # below this (in %), else it grades UP/DOWN immediately.
 FAST_GRADE       = os.environ.get("FAST_GRADE", "true").lower() == "true"
 FAST_TIE_EPS_PCT = float(os.environ.get("FAST_TIE_EPS_PCT", "0.0005"))
+# Stacking: up to MAX_STACK entries per window (like the live maker bot,
+# which added clips as the move re-qualified). STACK_COOLDOWN_SECS spaces
+# them out so it doesn't take all 3 in the same instant. Each entry reads
+# its own live ask, so later clips may get a different price. NOTE: the 3
+# stacked entries share ONE window outcome — read win RATE (per-entry, fine)
+# more than trade COUNT (which triple-counts a window).
+MAX_STACK           = int(os.environ.get("MAX_STACK", "1"))
+STACK_COOLDOWN_SECS = float(os.environ.get("STACK_COOLDOWN_SECS", "8"))
 TFS              = [int(x) for x in os.environ.get("TIMEFRAMES", "5").split(",")]
 
 ASSET_LIST = ["BTC", "ETH", "SOL", "DOGE", "BNB", "XRP", "HYPE"]
@@ -379,7 +387,8 @@ def handle_commands():
 open_windows = {}     # (asset,tf,open_ts) -> open_price captured at window start
 pending = []          # simulated trades awaiting settlement
 pending_lock = threading.Lock()
-fired = set()         # (asset,tf,open_ts) already taken (one sim entry per window)
+fired_count = {}      # (asset,tf,open_ts) -> num entries taken this window
+fired_last = {}       # (asset,tf,open_ts) -> ts of last entry (for cooldown)
 
 
 def engine():
@@ -403,8 +412,10 @@ def engine():
                     direction = "UP" if move >= 0 else "DOWN"
                     absmove = abs(move)
                     # SAME GATE as the maker bot
-                    if wkey in fired:
-                        continue
+                    if fired_count.get(wkey, 0) >= MAX_STACK:
+                        continue  # window already at its stack limit
+                    if time.time() - fired_last.get(wkey, 0) < STACK_COOLDOWN_SECS:
+                        continue  # space stacked entries out (re-qualify over time)
                     if not frontier_locked(asset, absmove, secs_left, tf):
                         continue
                     # gate fired — simulate TAKING: read the live ask we'd cross
@@ -416,7 +427,9 @@ def engine():
                     ask = best_ask_cents(tok)
                     if ask is None:
                         continue
-                    fired.add(wkey)
+                    # set cooldown regardless (so we don't re-hit the same instant),
+                    # but only a real take consumes a STACK SLOT.
+                    fired_last[wkey] = time.time()
                     if ask > TAKER_MAX_ASK_CENTS or ask < TAKER_MIN_ASK_CENTS:
                         # outside the accepted band — record why and skip
                         why = ("too high" if ask > TAKER_MAX_ASK_CENTS
@@ -431,6 +444,8 @@ def engine():
                         continue
                     rid = db_insert(asset, tf, direction, open_ts, close_ts,
                                     secs_left, move, ask, op)
+                    fired_count[wkey] = fired_count.get(wkey, 0) + 1
+                    clip_n = fired_count[wkey]
                     with pending_lock:
                         pending.append({"rid": rid, "asset": asset, "tf": tf,
                                         "direction": direction, "open_ts": open_ts,
@@ -438,8 +453,9 @@ def engine():
                                         "open_price": op, "ask": ask})
                     if SEND_EACH:
                         arrow = "⬆️" if direction == "UP" else "⬇️"
+                        clip_tag = f" clip {clip_n}/{MAX_STACK}" if MAX_STACK > 1 else ""
                         tg(f"📄 <b>PAPER TAKE {arrow} {ASSET_EMOJI.get(asset,'')}{asset} "
-                           f"{tf}m {direction}</b>\n"
+                           f"{tf}m {direction}{clip_tag}</b>\n"
                            f"take ask <b>{ask:.1f}¢</b> · move {move:+.3f}% @{secs_left:.0f}s left\n"
                            f"(would stake ${PAPER_STAKE:g}, win +${PAPER_STAKE*(100-ask)/ask:.2f} / "
                            f"lose -${PAPER_STAKE:.2f})")
@@ -450,11 +466,11 @@ def engine():
 
 
 def scorer():
-    """Two-tier grading. TIER 1 (fast, ~1s): at window close, grade off the
-    reference feed and post immediately, tagged with a lightning bolt. TIER 2
-    (confirm, 1-3 min): when Polymarket publishes the real settlement, check it;
-    if it disagrees, post a correction and fix the DB. ~1s feedback that
-    self-corrects to ground truth."""
+    """Grade off the reference feed at window close (~1s after). The feed tracks
+    the same price the market settles on, so close-vs-open direction IS the
+    outcome. No Polymarket settlement read (that field is trading price, not
+    resolution, and never cleanly flips). Waits up to 30s for a feed price at
+    close, else voids."""
     while True:
         try:
             time.sleep(0.5)
@@ -464,74 +480,38 @@ def scorer():
             for s in items:
                 if now < s["close_ts"]:
                     continue
-
-                # TIER 1: fast provisional grade off the feed (once)
-                if FAST_GRADE and not s.get("fast_done"):
-                    settle = prices_ref.get(s["asset"])
-                    op = s["open_price"]
-                    if settle is None:
-                        if now > s["close_ts"] + 20:
-                            s["fast_done"] = True
-                        continue
-                    s["fast_done"] = True
-                    move = (settle - op) / op * 100.0
-                    if abs(move) < FAST_TIE_EPS_PCT:
-                        # essentially no move — don't fast-grade; wait for the
-                        # real settlement to decide (avoids fake ties).
-                        s["fast_done"] = False
-                        if now > s["close_ts"] + 20:
-                            s["fast_skip"] = True
-                        continue
-                    won = (s["direction"] == ("UP" if move > 0 else "DOWN"))
-                    shares = PAPER_STAKE / (s["ask"] / 100.0)
-                    pnl = (shares * 1.0 - PAPER_STAKE) if won else -PAPER_STAKE
-                    result = "WIN" if won else "LOSS"
-                    s["fast_result"] = result
-                    db_resolve(s["rid"], None, result, round(pnl, 4))
-                    sb = db_scoreboard()
-                    emoji = "\u2705" if result == "WIN" else ("\u274c" if result == "LOSS" else "\u2796")
-                    wr = f"{sb['wr']:.1f}%" if sb["wr"] is not None else "\u2014"
-                    tg(f"{emoji}\u26a1 PAPER {ASSET_EMOJI.get(s['asset'],'')}{s['asset']} "
-                       f"{s['tf']}m {s['direction']} <b>{result}</b> ${pnl:+.2f}\n"
-                       f"\U0001f4c4 {sb['n']} trades \u00b7 {wr} (BE {sb['be']:.1f}%) \u00b7 P&L ${sb['pnl']:+.2f}")
-
-                # TIER 2: confirm against real Polymarket settlement
-                lastck = s.get("last_outcome_check", 0)
-                if now - lastck < 15:
-                    continue
-                s["last_outcome_check"] = now
-                outcome = fetch_polymarket_outcome(s["asset"], s["tf"], s["open_ts"])
-                if outcome is None:
-                    if now > s["close_ts"] + 600:
-                        if not s.get("fast_done"):
-                            db_resolve(s["rid"], None, "VOID", 0)
-                        log.warning(f"[SCORER] no settlement after 10min {s['asset']} {s['tf']}m")
+                settle = prices_ref.get(s["asset"])
+                op = s["open_price"]
+                if settle is None:
+                    if now > s["close_ts"] + 30:
+                        db_resolve(s["rid"], None, "VOID", 0)
+                        log.warning(f"[SCORER] VOID {s['asset']} {s['tf']}m — no feed price at close")
                         with pending_lock:
                             s in pending and pending.remove(s)
                     continue
-                if outcome == "TIE":
-                    true_result, true_pnl = "TIE", 0.0
-                else:
-                    won = (s["direction"] == outcome)
-                    shares = PAPER_STAKE / (s["ask"] / 100.0)
-                    true_pnl = (shares * 1.0 - PAPER_STAKE) if won else -PAPER_STAKE
-                    true_result = "WIN" if won else "LOSS"
-                if s.get("fast_done") and s.get("fast_result") != true_result:
-                    db_resolve(s["rid"], None, true_result, round(true_pnl, 4))
-                    tg(f"\U0001f527 CORRECTION {ASSET_EMOJI.get(s['asset'],'')}{s['asset']} "
-                       f"{s['tf']}m {s['direction']}: fast said {s.get('fast_result')}, "
-                       f"settlement says <b>{true_result}</b> \u2014 scoreboard fixed")
-                    log.info(f"[SCORER] corrected {s['asset']} {s['tf']}m {s.get('fast_result')}->{true_result}")
-                elif not s.get("fast_done"):
-                    db_resolve(s["rid"], None, true_result, round(true_pnl, 4))
-                    sb = db_scoreboard()
-                    emoji = "\u2705" if true_result == "WIN" else ("\u274c" if true_result == "LOSS" else "\u2796")
-                    wr = f"{sb['wr']:.1f}%" if sb["wr"] is not None else "\u2014"
-                    tg(f"{emoji} PAPER {ASSET_EMOJI.get(s['asset'],'')}{s['asset']} "
-                       f"{s['tf']}m {s['direction']} <b>{true_result}</b> ${true_pnl:+.2f}\n"
-                       f"\U0001f4c4 {sb['n']} trades \u00b7 {wr} (BE {sb['be']:.1f}%) \u00b7 P&L ${sb['pnl']:+.2f}")
+                move = (settle - op) / op * 100.0
+                if abs(move) < FAST_TIE_EPS_PCT:
+                    # essentially no move — wait a bit for the feed to tick off
+                    # the exact open; void only if it truly never moves.
+                    if now > s["close_ts"] + 30:
+                        db_resolve(s["rid"], None, "VOID", 0)
+                        with pending_lock:
+                            s in pending and pending.remove(s)
+                    continue
+                won = (s["direction"] == ("UP" if move > 0 else "DOWN"))
+                shares = PAPER_STAKE / (s["ask"] / 100.0)
+                pnl = (shares * 1.0 - PAPER_STAKE) if won else -PAPER_STAKE
+                result = "WIN" if won else "LOSS"
+                db_resolve(s["rid"], None, result, round(pnl, 4))
                 with pending_lock:
                     s in pending and pending.remove(s)
+                sb = db_scoreboard()
+                emoji = "\u2705" if result == "WIN" else "\u274c"
+                wr = f"{sb['wr']:.1f}%" if sb["wr"] is not None else "\u2014"
+                tg(f"{emoji} PAPER {ASSET_EMOJI.get(s['asset'],'')}{s['asset']} "
+                   f"{s['tf']}m {s['direction']} <b>{result}</b> ${pnl:+.2f} "
+                   f"({move:+.3f}%)\n"
+                   f"\U0001f4c4 {sb['n']} trades \u00b7 {wr} (BE {sb['be']:.1f}%) \u00b7 P&L ${sb['pnl']:+.2f}")
         except Exception as e:
             log.error(f"[SCORER] {e}")
 
