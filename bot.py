@@ -105,6 +105,20 @@ PER_ASSET_FRONTIER_15M = {      # 15m — MEASURED (from the probe grid)
 GLOBAL_FRONTIER = [(3, 0.02), (40, 0.10), (70, 0.20), (120, 0.40)]
 GLOBAL_FRONTIER_15M = [(10, 0.05), (20, 0.10), (40, 0.20), (70, 0.40), (120, 0.40)]
 FRONTIER_FALLBACK_PCT = float(os.environ.get("FRONTIER_FALLBACK_PCT", "0.40"))
+# Entries only allowed within this many seconds of close. The frontier
+# table is only defined to 120s; entering earlier uses an unvalidated
+# fallback, so we forbid it. This also matches the intent of a late-
+# entry strategy (enter as the outcome nears settlement, not 4 min out).
+ENTRY_MAX_SECS = float(os.environ.get("ENTRY_MAX_SECS", "120"))
+# Separate cutoff for 15m windows (they're 3x longer, so 120s is only the
+# final 13%). NOTE: the 15m frontier table is also only validated to 120s,
+# so entries in the 120s..ENTRY_MAX_SECS_15M zone use the 0.40% fallback,
+# not the grid — riskier, so treat those results with caution.
+ENTRY_MAX_SECS_15M = float(os.environ.get("ENTRY_MAX_SECS_15M", "120"))
+# Only capture a window's open price if we first see it within this many
+# seconds of its TRUE start (300s-secs_left for a 5m window). Windows we
+# join late get a wrong baseline, so we skip them entirely (mark bad).
+OPEN_CAPTURE_GRACE = float(os.environ.get("OPEN_CAPTURE_GRACE", "3"))
 HYPE_MIN_MOVE_PCT = float(os.environ.get("HYPE_MIN_MOVE_PCT", "0.16"))
 
 
@@ -403,11 +417,18 @@ def engine():
                     if ref is None:
                         continue
                     wkey = (asset, tf, open_ts)
-                    # capture open price once
+                    # capture open price once — ONLY if we caught the window near
+                    # its true start. elapsed = window_length - secs_left.
                     if wkey not in open_windows:
-                        open_windows[wkey] = ref
+                        elapsed = (tf * 60) - secs_left
+                        if elapsed <= OPEN_CAPTURE_GRACE:
+                            open_windows[wkey] = ref   # clean open, anchored to start
+                        else:
+                            open_windows[wkey] = None  # joined late — skip this window
                         continue
                     op = open_windows[wkey]
+                    if op is None:
+                        continue  # window had no clean open; never enter it
                     move = (ref - op) / op * 100.0
                     direction = "UP" if move >= 0 else "DOWN"
                     absmove = abs(move)
@@ -416,6 +437,9 @@ def engine():
                         continue  # window already at its stack limit
                     if time.time() - fired_last.get(wkey, 0) < STACK_COOLDOWN_SECS:
                         continue  # space stacked entries out (re-qualify over time)
+                    cutoff = ENTRY_MAX_SECS_15M if tf == 15 else ENTRY_MAX_SECS
+                    if secs_left > cutoff:
+                        continue  # too early for this timeframe's entry window
                     if not frontier_locked(asset, absmove, secs_left, tf):
                         continue
                     # gate fired — simulate TAKING: read the live ask we'd cross
