@@ -49,22 +49,37 @@ except ImportError:
 TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 PAPER_STAKE      = float(os.environ.get("PAPER_STAKE", "5"))
-TAKER_MAX_ASK_CENTS = float(os.environ.get("TAKER_MAX_ASK_CENTS", "99.5"))
+TAKER_MAX_ASK_CENTS = float(os.environ.get("TAKER_MAX_ASK_CENTS", "5"))   # longshot ceiling
 # Floor: skip entries CHEAPER than this — the market pricing an outcome below
 # this is telling you it's too uncertain (the 89¢ coin-flip that lost). Note:
 # tightening the band [MIN, MAX] does NOT create an edge — inside the band, win
 # rate still ≈ price paid. It only stops the bot taking obviously-uncertain
 # trades. Default 0 = no floor (take anything up to the ceiling).
-TAKER_MIN_ASK_CENTS = float(os.environ.get("TAKER_MIN_ASK_CENTS", "0"))
-DB_PATH          = os.environ.get("DB_PATH", "paper_taker.db")
+TAKER_MIN_ASK_CENTS = float(os.environ.get("TAKER_MIN_ASK_CENTS", "1"))   # longshot floor
+DB_PATH          = os.environ.get("DB_PATH", "paper_reversal.db")
 SEND_EACH        = os.environ.get("SEND_EACH", "true").lower() == "true"
-# Fast grading: grade instantly off the reference feed at window close (~1s),
-# then confirm against real Polymarket settlement when it lands and correct any
-# disagreement. FAST_GRADE=true gives ~1s results; false uses settlement-only
-# (accurate but 1-3 min). Epsilon: a window only provisionally ties if |move| is
-# below this (in %), else it grades UP/DOWN immediately.
 FAST_GRADE       = os.environ.get("FAST_GRADE", "true").lower() == "true"
 FAST_TIE_EPS_PCT = float(os.environ.get("FAST_TIE_EPS_PCT", "0.0005"))
+# Settlement grading: poll Polymarket for the REAL resolved outcome every
+# SETTLE_POLL_SECS after close (resolution takes ~1-5 min). If it still has
+# not resolved after SETTLE_TIMEOUT_SECS, fall back to feed-grading (tagged
+# in the message) so rare longshot data points are not lost to VOIDs.
+SETTLE_POLL_SECS    = float(os.environ.get("SETTLE_POLL_SECS", "15"))
+SETTLE_TIMEOUT_SECS = float(os.environ.get("SETTLE_TIMEOUT_SECS", "900"))
+
+# ── REVERSAL CONFIG — last-seconds trailing-side buyer ───────────────────────
+# The 2.4M-sample probe table: with 10-20s left, a 0.02-0.05% move still
+# reverses ~10% of the time; under 0.02% it reverses ~32%. This bot buys the
+# TRAILING side of a small late move — but ONLY when its ask is under that
+# bucket's measured comeback rate (minus margin). If the market charges more,
+# the trade is skipped and the ask is logged: the skip census is itself the
+# answer to "does the market price these reversals fairly?"
+REV_MAX_SECS_LEFT = float(os.environ.get("REV_MAX_SECS_LEFT", "20"))
+REV_MOVE_MAX_PCT  = float(os.environ.get("REV_MOVE_MAX_PCT", "0.05"))
+REV_BUCKET_SPLIT  = float(os.environ.get("REV_BUCKET_SPLIT", "0.02"))
+REV_MAX_ASK_TINY  = float(os.environ.get("REV_MAX_ASK_TINY", "25"))   # <0.02%: comeback ~32
+REV_MAX_ASK_SMALL = float(os.environ.get("REV_MAX_ASK_SMALL", "8"))   # 0.02-0.05%: ~10
+REV_MIN_ASK       = float(os.environ.get("REV_MIN_ASK", "1"))
 # Stacking: up to MAX_STACK entries per window (like the live maker bot,
 # which added clips as the move re-qualified). STACK_COOLDOWN_SECS spaces
 # them out so it doesn't take all 3 in the same instant. Each entry reads
@@ -79,18 +94,18 @@ ASSET_LIST = ["BTC", "ETH", "SOL", "DOGE", "BNB", "XRP", "HYPE"]
 ASSET_EMOJI = {"BTC": "🟠", "ETH": "🔷", "SOL": "🟣", "DOGE": "🟡",
                "BNB": "🟨", "XRP": "⚪", "HYPE": "🟢"}
 
-# ── GATE: guessed 5m table (from bot_variant.py) + measured 15m table (from
-#    bot_variant_MEASURED.py). This is the config you asked to paper-test:
-#    your real guessed 5-minute strategy, paired with the probe-MEASURED 15m
-#    surface (more defensible than the guessed scaling rule for 15m). ──
-PER_ASSET_FRONTIER = {          # 5m — GUESSED (matches live bot_variant.py)
-    "BTC":  [(20, 0.025), (40, 0.04), (70, 0.08), (120, 0.15)],
-    "ETH":  [(20, 0.03), (40, 0.07), (70, 0.11), (120, 0.16)],
-    "XRP":  [(20, 0.04), (40, 0.10), (70, 0.15), (120, 0.23)],
-    "DOGE": [(20, 0.05), (40, 0.10), (70, 0.15), (120, 0.22)],
-    "BNB":  [(20, 0.04), (40, 0.10), (70, 0.17), (120, 0.20)],
-    "SOL":  [(20, 0.10), (40, 0.17), (70, 0.21), (120, 0.27)],
-    "HYPE": [(20, 0.16), (40, 0.20), (70, 0.24), (120, 0.30)],
+# ── GATE: MEASURED 5m table + MEASURED 15m table (both from bot_variant_MEASURED
+#    .py / the 2.4M-sample probe frontier). This is the config your own data
+#    endorses: the frontier lock line for BTC/XRP/DOGE/BNB, tightened for the
+#    volatile SOL/HYPE/ETH. Paired taker version of the measured bot. ──
+PER_ASSET_FRONTIER = {          # 5m — MEASURED (matches bot_variant_MEASURED.py)
+    "BTC":  [(10, 0.05), (20, 0.10), (40, 0.10), (70, 0.20), (120, 0.40)],
+    "ETH":  [(10, 0.05), (20, 0.10), (40, 0.20), (70, 0.40), (120, 0.40)],
+    "SOL":  [(10, 0.10), (20, 0.20), (40, 0.40), (70, 0.40), (120, 0.40)],
+    "XRP":  [(10, 0.05), (20, 0.10), (40, 0.10), (70, 0.20), (120, 0.40)],
+    "DOGE": [(10, 0.05), (20, 0.10), (40, 0.10), (70, 0.20), (120, 0.40)],
+    "BNB":  [(10, 0.05), (20, 0.10), (40, 0.10), (70, 0.20), (120, 0.40)],
+    "HYPE": [(10, 0.10), (20, 0.20), (40, 0.40), (70, 0.40), (120, 0.40)],
 }
 PER_ASSET_FRONTIER_15M = {      # 15m — MEASURED (from the probe grid)
     "BTC":  [(10, 0.05), (20, 0.10), (40, 0.10), (70, 0.10), (120, 0.10)],
@@ -102,7 +117,7 @@ PER_ASSET_FRONTIER_15M = {      # 15m — MEASURED (from the probe grid)
     "HYPE": [(10, 0.05), (20, 0.10), (40, 0.20), (70, 0.40), (120, 0.40)],
 }
 # 5m fallback mirrors the guessed bot's global gate; 15m falls back to its table.
-GLOBAL_FRONTIER = [(3, 0.02), (40, 0.10), (70, 0.20), (120, 0.40)]
+GLOBAL_FRONTIER = [(10, 0.05), (20, 0.10), (40, 0.20), (70, 0.40), (120, 0.40)]
 GLOBAL_FRONTIER_15M = [(10, 0.05), (20, 0.10), (40, 0.20), (70, 0.40), (120, 0.40)]
 FRONTIER_FALLBACK_PCT = float(os.environ.get("FRONTIER_FALLBACK_PCT", "0.40"))
 # Entries only allowed within this many seconds of close. The frontier
@@ -115,11 +130,13 @@ ENTRY_MAX_SECS = float(os.environ.get("ENTRY_MAX_SECS", "120"))
 # so entries in the 120s..ENTRY_MAX_SECS_15M zone use the 0.40% fallback,
 # not the grid — riskier, so treat those results with caution.
 ENTRY_MAX_SECS_15M = float(os.environ.get("ENTRY_MAX_SECS_15M", "120"))
+# LONGSHOT: only enter within the FIRST minute of a window (near the open).
+ENTRY_FIRST_SECS = float(os.environ.get("ENTRY_FIRST_SECS", "60"))
 # Only capture a window's open price if we first see it within this many
 # seconds of its TRUE start (300s-secs_left for a 5m window). Windows we
 # join late get a wrong baseline, so we skip them entirely (mark bad).
 OPEN_CAPTURE_GRACE = float(os.environ.get("OPEN_CAPTURE_GRACE", "3"))
-HYPE_MIN_MOVE_PCT = float(os.environ.get("HYPE_MIN_MOVE_PCT", "0.16"))
+HYPE_MIN_MOVE_PCT = float(os.environ.get("HYPE_MIN_MOVE_PCT", "0.0"))
 
 
 def _frontier_lookup(bands, secs_left):
@@ -155,7 +172,7 @@ GAMMA_BASE = "https://gamma-api.polymarket.com"
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [%(levelname)s] %(message)s",
                     handlers=[logging.StreamHandler()])
-log = logging.getLogger("paper-taker")
+log = logging.getLogger("paper-reversal")
 
 prices_chainlink = {}
 chainlink_last_update = {}
@@ -383,16 +400,35 @@ def handle_commands():
             if str(u.get("message", {}).get("chat", {}).get("id")) != str(TELEGRAM_CHAT_ID):
                 continue
             if t == "/stats":
-                s = db_scoreboard()
-                wr = f"{s['wr']:.1f}%" if s["wr"] is not None else "—"
-                verdict = ("ABOVE break-even ✅" if s["wr"] and s["wr"] > s["be"]
-                           else "below break-even ⚠️")
-                tg(f"📄 <b>PAPER TAKER scoreboard</b>\n"
-                   f"simulated trades: {s['n']}\n"
-                   f"win rate: <b>{wr}</b>\n"
-                   f"avg ask paid: {s['avg_ask']:.1f}¢ → break-even ≈ {s['be']:.1f}%\n"
-                   f"{verdict}\n"
-                   f"paper P&L: <b>${s['pnl']:+.2f}</b> ({PAPER_STAKE:g}/trade)")
+                conn = sqlite3.connect(DB_PATH)
+                c = conn.cursor()
+                c.execute("SELECT ABS(move_pct), result, pnl, ask_cents FROM paper "
+                          "WHERE result IN ('WIN','LOSS')")
+                rows = c.fetchall()
+                conn.close()
+                def bstats(sub):
+                    n = len(sub)
+                    w = sum(1 for r in sub if r[1] == "WIN")
+                    pnl = sum(r[2] or 0 for r in sub)
+                    aask = (sum(r[3] or 0 for r in sub) / n) if n else 0.0
+                    return n, w, ((w / n * 100) if n else None), aask, pnl
+                tiny = [r for r in rows if r[0] < REV_BUCKET_SPLIT]
+                small = [r for r in rows if r[0] >= REV_BUCKET_SPLIT]
+                lines = []
+                for name, sub, hist in ((f"tiny <{REV_BUCKET_SPLIT:.2f}%", tiny, 32),
+                                        (f"small {REV_BUCKET_SPLIT:.2f}-{REV_MOVE_MAX_PCT:.2f}%", small, 10)):
+                    n, w, wr, aask, pnl = bstats(sub)
+                    if n == 0:
+                        lines.append(f"{name}: no trades yet (hist. comeback ~{hist}%)")
+                    else:
+                        mark = "✅" if wr is not None and wr > aask else "⚠️"
+                        lines.append(f"{name}: {w}/{n} ({wr:.1f}%) vs BE {aask:.1f}¢ {mark} · ${pnl:+.2f}")
+                nA, wA, wrA, aaskA, pnlA = bstats(rows)
+                wr_s = f"{wrA:.1f}%" if wrA is not None else "—"
+                tg("🔄 <b>REVERSAL scoreboard</b> (last-20s trailing side)\n"
+                   f"all: {nA} · {wr_s} win · P&L <b>${pnlA:+.2f}</b>\n"
+                   + "\n".join(lines) +
+                   "\nbucket is +EV only if win% beats its avg ask")
     except Exception:
         pass
 
@@ -430,46 +466,45 @@ def engine():
                     if op is None:
                         continue  # window had no clean open; never enter it
                     move = (ref - op) / op * 100.0
-                    direction = "UP" if move >= 0 else "DOWN"
                     absmove = abs(move)
-                    # SAME GATE as the maker bot
+                    # REVERSAL LOGIC — final REV_MAX_SECS_LEFT seconds only. When
+                    # the move from open is SMALL, the probe table says the
+                    # trailing side still comes back often (~32% under 0.02%,
+                    # ~10% at 0.02-0.05%, at 10-20s left). Buy the TRAILING side,
+                    # but only if its ask is UNDER the bucket's comeback-rate cap
+                    # — i.e. only when the market charges less than the comeback
+                    # is historically worth.
                     if fired_count.get(wkey, 0) >= MAX_STACK:
-                        continue  # window already at its stack limit
-                    if time.time() - fired_last.get(wkey, 0) < STACK_COOLDOWN_SECS:
-                        continue  # space stacked entries out (re-qualify over time)
-                    cutoff = ENTRY_MAX_SECS_15M if tf == 15 else ENTRY_MAX_SECS
-                    if secs_left > cutoff:
-                        continue  # too early for this timeframe's entry window
-                    if not frontier_locked(asset, absmove, secs_left, tf):
                         continue
-                    # gate fired — simulate TAKING: read the live ask we'd cross
+                    if time.time() - fired_last.get(wkey, 0) < STACK_COOLDOWN_SECS:
+                        continue  # throttle re-checks (a skipped ask can still
+                                  # drop into the cap later in the final seconds)
+                    if secs_left > REV_MAX_SECS_LEFT:
+                        continue  # only the final seconds
+                    if absmove >= REV_MOVE_MAX_PCT or move == 0.0:
+                        continue  # too big (frontier territory) or no leader yet
+                    bucket = "tiny" if absmove < REV_BUCKET_SPLIT else "small"
+                    cap = REV_MAX_ASK_TINY if bucket == "tiny" else REV_MAX_ASK_SMALL
+                    direction = "DOWN" if move > 0 else "UP"   # the trailing side
                     toks = resolve_tokens(asset, tf, open_ts)
                     if not toks:
                         continue
                     up_tok, down_tok = toks
-                    tok = up_tok if direction == "UP" else down_tok
-                    ask = best_ask_cents(tok)
+                    ask = best_ask_cents(up_tok if direction == "UP" else down_tok)
+                    fired_last[wkey] = time.time()
                     if ask is None:
                         continue
-                    # set cooldown regardless (so we don't re-hit the same instant),
-                    # but only a real take consumes a STACK SLOT.
-                    fired_last[wkey] = time.time()
-                    if ask > TAKER_MAX_ASK_CENTS or ask < TAKER_MIN_ASK_CENTS:
-                        # outside the accepted band — record why and skip
-                        why = ("too high" if ask > TAKER_MAX_ASK_CENTS
-                               else "too uncertain")
-                        log.info(f"[PAPER] {asset} {tf}m {direction} gate fired but "
-                                 f"ask {ask:.1f}¢ {why} "
-                                 f"(band {TAKER_MIN_ASK_CENTS:.0f}-{TAKER_MAX_ASK_CENTS:.0f}¢) — skip")
-                        if SEND_EACH:
-                            tg(f"⚪ PAPER skip {ASSET_EMOJI.get(asset,'')}{asset} {tf}m "
-                               f"{direction} · ask {ask:.1f}¢ {why} ({absmove:.3f}% "
-                               f"@{secs_left:.0f}s)")
+                    if ask < REV_MIN_ASK or ask > cap:
+                        # the market charges more than the comeback is worth —
+                        # skip, but LOG the ask: this census answers whether the
+                        # market prices small-move reversals fairly.
+                        log.info(f"[REV-SKIP] {asset} {tf}m {direction} ask {ask:.1f}¢ "
+                                 f"> cap {cap:.0f}¢ ({bucket}, move {move:+.3f}%, "
+                                 f"{secs_left:.0f}s left)")
                         continue
                     rid = db_insert(asset, tf, direction, open_ts, close_ts,
                                     secs_left, move, ask, op)
                     fired_count[wkey] = fired_count.get(wkey, 0) + 1
-                    clip_n = fired_count[wkey]
                     with pending_lock:
                         pending.append({"rid": rid, "asset": asset, "tf": tf,
                                         "direction": direction, "open_ts": open_ts,
@@ -477,12 +512,15 @@ def engine():
                                         "open_price": op, "ask": ask})
                     if SEND_EACH:
                         arrow = "⬆️" if direction == "UP" else "⬇️"
-                        clip_tag = f" clip {clip_n}/{MAX_STACK}" if MAX_STACK > 1 else ""
-                        tg(f"📄 <b>PAPER TAKE {arrow} {ASSET_EMOJI.get(asset,'')}{asset} "
-                           f"{tf}m {direction}{clip_tag}</b>\n"
-                           f"take ask <b>{ask:.1f}¢</b> · move {move:+.3f}% @{secs_left:.0f}s left\n"
-                           f"(would stake ${PAPER_STAKE:g}, win +${PAPER_STAKE*(100-ask)/ask:.2f} / "
-                           f"lose -${PAPER_STAKE:.2f})")
+                        shares = PAPER_STAKE / (ask / 100.0)
+                        win_amt = shares * 1.0 - PAPER_STAKE
+                        hist = 32 if bucket == "tiny" else 10
+                        tg(f"🔄 <b>REVERSAL {arrow} {ASSET_EMOJI.get(asset,'')}{asset} "
+                           f"{tf}m buy {direction}</b>\n"
+                           f"<b>{ask:.1f}¢</b> ({shares:.0f} sh) · leader {move:+.3f}% · "
+                           f"{secs_left:.0f}s left\n"
+                           f"{bucket} bucket (hist. comeback ~{hist}%) · "
+                           f"win +${win_amt:.2f} / lose -${PAPER_STAKE:.2f}")
                     log.info(f"[PAPER] TAKE {asset} {tf}m {direction} ask {ask:.1f}¢ "
                              f"move {move:+.3f}% {secs_left:.0f}s left")
         except Exception as e:
@@ -490,11 +528,12 @@ def engine():
 
 
 def scorer():
-    """Grade off the reference feed at window close (~1s after). The feed tracks
-    the same price the market settles on, so close-vs-open direction IS the
-    outcome. No Polymarket settlement read (that field is trading price, not
-    resolution, and never cleanly flips). Waits up to 30s for a feed price at
-    close, else voids."""
+    """Grade against the REAL Polymarket settlement. After close, poll the Gamma
+    outcome every SETTLE_POLL_SECS; outcomePrices flips to ~[1,0]/[0,1] once
+    Chainlink resolves (takes ~1-5 min — fine for a bot that trades rarely, and
+    ground truth matters here: one longshot win is worth 20-100x the stake, so a
+    single mis-grade would distort everything). If settlement never appears
+    within SETTLE_TIMEOUT_SECS, fall back to feed-grading, tagged so you know."""
     while True:
         try:
             time.sleep(0.5)
@@ -502,27 +541,30 @@ def scorer():
             with pending_lock:
                 items = list(pending)
             for s in items:
-                if now < s["close_ts"]:
+                if now < s["close_ts"] + 2:
                     continue
-                settle = prices_ref.get(s["asset"])
-                op = s["open_price"]
-                if settle is None:
-                    if now > s["close_ts"] + 30:
-                        db_resolve(s["rid"], None, "VOID", 0)
-                        log.warning(f"[SCORER] VOID {s['asset']} {s['tf']}m — no feed price at close")
-                        with pending_lock:
-                            s in pending and pending.remove(s)
+
+                # throttle settlement polls
+                if now - s.get("last_outcome_check", 0) < SETTLE_POLL_SECS:
                     continue
-                move = (settle - op) / op * 100.0
-                if abs(move) < FAST_TIE_EPS_PCT:
-                    # essentially no move — wait a bit for the feed to tick off
-                    # the exact open; void only if it truly never moves.
-                    if now > s["close_ts"] + 30:
-                        db_resolve(s["rid"], None, "VOID", 0)
-                        with pending_lock:
-                            s in pending and pending.remove(s)
+                s["last_outcome_check"] = now
+
+                outcome = fetch_polymarket_outcome(s["asset"], s["tf"], s["open_ts"])
+                if outcome is None:
+                    if now <= s["close_ts"] + SETTLE_TIMEOUT_SECS:
+                        continue  # not resolved yet — keep waiting
+                    # timeout: NO feed fallback here. This bot's trades live in
+                    # near-flat windows — exactly where the feed and Chainlink
+                    # can disagree — so an ungradeable trade is VOID, never
+                    # guessed.
+                    db_resolve(s["rid"], None, "VOID", 0)
+                    log.warning(f"[SCORER] VOID {s['asset']} {s['tf']}m — "
+                                f"no settlement within timeout")
+                    with pending_lock:
+                        s in pending and pending.remove(s)
                     continue
-                won = (s["direction"] == ("UP" if move > 0 else "DOWN"))
+
+                won = (s["direction"] == outcome)
                 shares = PAPER_STAKE / (s["ask"] / 100.0)
                 pnl = (shares * 1.0 - PAPER_STAKE) if won else -PAPER_STAKE
                 result = "WIN" if won else "LOSS"
@@ -530,12 +572,12 @@ def scorer():
                 with pending_lock:
                     s in pending and pending.remove(s)
                 sb = db_scoreboard()
-                emoji = "\u2705" if result == "WIN" else "\u274c"
+                emoji = "\u2705" if won else "\u274c"
                 wr = f"{sb['wr']:.1f}%" if sb["wr"] is not None else "\u2014"
-                tg(f"{emoji} PAPER {ASSET_EMOJI.get(s['asset'],'')}{s['asset']} "
-                   f"{s['tf']}m {s['direction']} <b>{result}</b> ${pnl:+.2f} "
-                   f"({move:+.3f}%)\n"
-                   f"\U0001f4c4 {sb['n']} trades \u00b7 {wr} (BE {sb['be']:.1f}%) \u00b7 P&L ${sb['pnl']:+.2f}")
+                tg(f"{emoji} REVERSAL {ASSET_EMOJI.get(s['asset'],'')}{s['asset']} "
+                   f"{s['tf']}m {s['direction']} <b>{result}</b> ${pnl:+.2f}"
+                   f" \u00b7 bought {s['ask']:.1f}\u00a2\n"
+                   f"\U0001f504 {sb['n']} trades \u00b7 {wr} win \u00b7 P&L ${sb['pnl']:+.2f}")
         except Exception as e:
             log.error(f"[SCORER] {e}")
 
@@ -547,10 +589,12 @@ def main():
     threading.Thread(target=binance_ref_worker, daemon=True).start()
     threading.Thread(target=engine, daemon=True).start()
     threading.Thread(target=scorer, daemon=True).start()
-    tg(f"📄 <b>PAPER TAKER live</b> — no money\n"
-       f"same gate as the maker bot; simulates TAKING the ask instead of resting a bid\n"
-       f"tf={TFS} · stake ${PAPER_STAKE:g} · skip if ask > {TAKER_MAX_ASK_CENTS:.0f}¢\n"
-       f"the scoreboard decides: does taking clear break-even?\n/stats")
+    tg(f"🔄 <b>PAPER REVERSAL live</b> — no money\n"
+       f"final {REV_MAX_SECS_LEFT:.0f}s: if the move is under {REV_MOVE_MAX_PCT:.2f}%, "
+       f"buy the TRAILING side when its ask is under the bucket cap\n"
+       f"caps: tiny(<{REV_BUCKET_SPLIT:.2f}%) ≤{REV_MAX_ASK_TINY:.0f}¢ · "
+       f"small ≤{REV_MAX_ASK_SMALL:.0f}¢ · tf={TFS} · stake ${PAPER_STAKE:g}\n"
+       f"settlement-graded ONLY (near-flat windows are never feed-guessed)\n/stats")
     while True:
         try:
             handle_commands()
