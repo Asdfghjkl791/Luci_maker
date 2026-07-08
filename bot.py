@@ -376,9 +376,21 @@ def db_scoreboard():
 # ── TELEGRAM ─────────────────────────────────────────────────────────────────
 def tg(msg):
     try:
-        requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-                      json={"chat_id": TELEGRAM_CHAT_ID, "text": msg,
-                            "parse_mode": "HTML"}, timeout=8)
+        r = requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+                          json={"chat_id": TELEGRAM_CHAT_ID, "text": msg,
+                                "parse_mode": "HTML"}, timeout=8)
+        try:
+            body = r.json()
+        except Exception:
+            body = {}
+        if getattr(r, "status_code", 200) != 200 or not body.get("ok", False):
+            # Telegram REJECTED the send (bad token = 401/404, bad chat_id or
+            # malformed HTML = 400). Without this check the bot logs success
+            # while the chat stays empty.
+            log.error(f"[TG] REJECTED {getattr(r, 'status_code', '?')}: "
+                      f"{str(body)[:160]} — check TELEGRAM_TOKEN / "
+                      f"TELEGRAM_CHAT_ID on this service")
+            return
         log.info(f"[TG] {msg[:80]}")
     except Exception as e:
         log.error(f"TG error: {e}")
