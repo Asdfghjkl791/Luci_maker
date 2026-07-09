@@ -414,8 +414,8 @@ def handle_commands():
             if t == "/stats":
                 conn = sqlite3.connect(DB_PATH)
                 c = conn.cursor()
-                c.execute("SELECT ABS(move_pct), result, pnl, ask_cents FROM paper "
-                          "WHERE result IN ('WIN','LOSS')")
+                c.execute("SELECT ABS(move_pct), result, pnl, ask_cents, secs_left "
+                          "FROM paper WHERE result IN ('WIN','LOSS')")
                 rows = c.fetchall()
                 conn.close()
                 def bstats(sub):
@@ -424,23 +424,31 @@ def handle_commands():
                     pnl = sum(r[2] or 0 for r in sub)
                     aask = (sum(r[3] or 0 for r in sub) / n) if n else 0.0
                     return n, w, ((w / n * 100) if n else None), aask, pnl
-                tiny = [r for r in rows if r[0] < REV_BUCKET_SPLIT]
-                small = [r for r in rows if r[0] >= REV_BUCKET_SPLIT]
-                lines = []
-                for name, sub, hist in ((f"tiny <{REV_BUCKET_SPLIT:.2f}%", tiny, 32),
-                                        (f"small {REV_BUCKET_SPLIT:.2f}-{REV_MOVE_MAX_PCT:.2f}%", small, 10)):
+                def bline(name, sub, hist=None):
                     n, w, wr, aask, pnl = bstats(sub)
                     if n == 0:
-                        lines.append(f"{name}: no trades yet (hist. comeback ~{hist}%)")
-                    else:
-                        mark = "✅" if wr is not None and wr > aask else "⚠️"
-                        lines.append(f"{name}: {w}/{n} ({wr:.1f}%) vs BE {aask:.1f}¢ {mark} · ${pnl:+.2f}")
+                        h = f" (hist. comeback ~{hist}%)" if hist else ""
+                        return f"{name}: no trades yet{h}"
+                    mark = "✅" if wr is not None and wr > aask else "⚠️"
+                    return (f"{name}: {w}/{n} ({wr:.1f}%) vs BE {aask:.1f}¢ "
+                            f"{mark} · ${pnl:+.2f}")
+                tiny = [r for r in rows if r[0] < REV_BUCKET_SPLIT]
+                small = [r for r in rows if r[0] >= REV_BUCKET_SPLIT]
+                t20 = [r for r in rows if (r[4] or 0) <= 20]
+                t40 = [r for r in rows if 20 < (r[4] or 0) <= 40]
+                t60 = [r for r in rows if (r[4] or 0) > 40]
                 nA, wA, wrA, aaskA, pnlA = bstats(rows)
                 wr_s = f"{wrA:.1f}%" if wrA is not None else "—"
-                tg("🔄 <b>REVERSAL scoreboard</b> (last-20s trailing side)\n"
+                tg(f"🔄 <b>REVERSAL scoreboard</b> (last {REV_MAX_SECS_LEFT:.0f}s, trailing side)\n"
                    f"all: {nA} · {wr_s} win · P&L <b>${pnlA:+.2f}</b>\n"
-                   + "\n".join(lines) +
-                   "\nbucket is +EV only if win% beats its avg ask")
+                   f"— by move —\n"
+                   + bline(f"tiny &lt;{REV_BUCKET_SPLIT:.2f}%", tiny, 32) + "\n"
+                   + bline(f"small {REV_BUCKET_SPLIT:.2f}-{REV_MOVE_MAX_PCT:.2f}%", small, 10) + "\n"
+                   f"— by time left —\n"
+                   + bline("≤20s", t20) + "\n"
+                   + bline("20-40s", t40) + "\n"
+                   + bline("40s+", t60) +
+                   "\na bucket is +EV only if win% beats its avg ask")
     except Exception:
         pass
 
@@ -604,7 +612,7 @@ def main():
     tg(f"🔄 <b>PAPER REVERSAL live</b> — no money\n"
        f"final {REV_MAX_SECS_LEFT:.0f}s: if the move is under {REV_MOVE_MAX_PCT:.2f}%, "
        f"buy the TRAILING side when its ask is under the bucket cap\n"
-       f"caps: tiny(<{REV_BUCKET_SPLIT:.2f}%) ≤{REV_MAX_ASK_TINY:.0f}¢ · "
+       f"caps: tiny(&lt;{REV_BUCKET_SPLIT:.2f}%) ≤{REV_MAX_ASK_TINY:.0f}¢ · "
        f"small ≤{REV_MAX_ASK_SMALL:.0f}¢ · tf={TFS} · stake ${PAPER_STAKE:g}\n"
        f"settlement-graded ONLY (near-flat windows are never feed-guessed)\n/stats")
     while True:
