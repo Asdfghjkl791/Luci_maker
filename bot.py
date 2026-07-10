@@ -113,19 +113,28 @@ def init_db():
         id INTEGER PRIMARY KEY AUTOINCREMENT, created TEXT,
         asset TEXT, tf INTEGER, open_ts INTEGER, secs_left REAL,
         side TEXT, sum_cents REAL, edge_cents REAL,
-        pairs REAL, locked_usd REAL, duration_secs REAL)""")
+        pairs REAL, locked_usd REAL, duration_secs REAL,
+        depth_avail REAL, confirmed INTEGER DEFAULT 1)""")
+    for col in ("depth_avail REAL", "confirmed INTEGER DEFAULT 1"):
+        try:
+            conn.execute(f"ALTER TABLE sightings ADD COLUMN {col}")
+        except Exception:
+            pass
     conn.commit()
     conn.close()
 
 
-def db_insert_sighting(asset, tf, open_ts, secs_left, side, sum_c, edge, pairs, locked):
+def db_insert_sighting(asset, tf, open_ts, secs_left, side, sum_c, edge,
+                       pairs, locked, depth_avail, confirmed):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("""INSERT INTO sightings (created,asset,tf,open_ts,secs_left,side,
-                 sum_cents,edge_cents,pairs,locked_usd,duration_secs)
-                 VALUES (?,?,?,?,?,?,?,?,?,?,NULL)""",
+                 sum_cents,edge_cents,pairs,locked_usd,duration_secs,
+                 depth_avail,confirmed)
+                 VALUES (?,?,?,?,?,?,?,?,?,?,NULL,?,?)""",
               (datetime.now(timezone.utc).isoformat(), asset, tf, open_ts,
-               secs_left, side, sum_c, edge, pairs, locked))
+               secs_left, side, sum_c, edge, pairs, locked, depth_avail,
+               1 if confirmed else 0))
     rid = c.lastrowid
     conn.commit()
     conn.close()
@@ -179,15 +188,19 @@ def handle_commands():
             if t == "/stats":
                 conn = sqlite3.connect(DB_PATH)
                 c = conn.cursor()
-                c.execute("SELECT side, edge_cents, locked_usd, duration_secs FROM sightings")
+                c.execute("SELECT side, edge_cents, locked_usd, duration_secs, "
+                          "asset, depth_avail, COALESCE(confirmed,1), secs_left "
+                          "FROM sightings")
                 rows = c.fetchall()
                 conn.close()
+                conf = [r for r in rows if r[6] == 1]
+                phan = [r for r in rows if r[6] == 0]
                 if not rows:
-                    tg("💵 <b>PAIR-ARB census</b>\nno sightings yet — the books have "
+                    tg("💵 <b>PAIR-ARB census</b>\nno sightings yet — books have "
                        "summed to ≥100¢ every scan (tight market = correct silence)")
                     continue
                 def sec(side):
-                    sub = [r for r in rows if r[0] == side]
+                    sub = [r for r in conf if r[0] == side]
                     if not sub:
                         return f"{side}: none"
                     n = len(sub)
@@ -196,11 +209,33 @@ def handle_commands():
                     tot = sum(r[2] or 0 for r in sub)
                     durs = [r[3] for r in sub if r[3] is not None]
                     avg_d = (sum(durs) / len(durs)) if durs else 0
-                    return (f"{side}: {n} sightings · edge avg {avg_e:.1f}¢ max {mx_e:.1f}¢ "
-                            f"· lived ~{avg_d:.0f}s · locked ${tot:+.2f}")
-                tg("💵 <b>PAIR-ARB census</b>\n" + sec("BUY") + "\n" + sec("SELL") +
-                   f"\n(edge ≥{PAIR_MIN_EDGE_CENTS:.1f}¢, depth ≥{PAIR_MIN_DEPTH:.0f} "
-                   f"each side, {PAIR_SHARES:.0f} pairs/sighting)")
+                    dep = [r[5] for r in sub if r[5]]
+                    avg_dep = (sum(dep) / len(dep)) if dep else 0
+                    return (f"{side}: {n} · edge avg {avg_e:.1f}¢ max {mx_e:.1f}¢ · "
+                            f"lived ~{avg_d:.0f}s · depth ~{avg_dep:.0f} · ${tot:+.2f}")
+                ebuckets = [("&lt;1¢", 0, 1), ("1-2¢", 1, 2), ("2-5¢", 2, 5), ("5¢+", 5, 999)]
+                elines = []
+                for name, lo, hi in ebuckets:
+                    sub = [r for r in conf if lo <= r[1] < hi]
+                    if sub:
+                        elines.append(f"{name}: {len(sub)} (${sum(r[2] or 0 for r in sub):+.2f})")
+                assets = {}
+                for r in conf:
+                    assets.setdefault(r[4], [0, 0.0])
+                    assets[r[4]][0] += 1
+                    assets[r[4]][1] += (r[2] or 0)
+                top = sorted(assets.items(), key=lambda kv: -kv[1][1])[:4]
+                alines = " · ".join(f"{a} {n}x ${v:+.2f}" for a, (n, v) in top)
+                t_early = sum(1 for r in conf if (r[7] or 0) > 120)
+                t_mid = sum(1 for r in conf if 30 < (r[7] or 0) <= 120)
+                t_late = sum(1 for r in conf if (r[7] or 0) <= 30)
+                ph_rate = (len(phan) / len(rows) * 100) if rows else 0
+                tg("💵 <b>PAIR-ARB census</b> (confirmed by re-read)\n"
+                   + sec("BUY") + "\n" + sec("SELL") + "\n"
+                   f"phantoms: {len(phan)} ({ph_rate:.0f}% of first-read crosses vanished)\n"
+                   f"by edge: " + " · ".join(elines) + "\n"
+                   f"when: &gt;120s {t_early} · 30-120s {t_mid} · ≤30s {t_late}\n"
+                   f"top: {alines}")
     except Exception:
         pass
 
@@ -227,24 +262,11 @@ def scanner():
                         continue
                     ua, usz, ub, ubsz = up
                     da, dsz, db_, dbsz = dn
+                    _side(asset, tf, open_ts, secs_left, "BUY",
+                          ua + da, 100.0 - (ua + da), min(usz, dsz), toks, now)
+                    _side(asset, tf, open_ts, secs_left, "SELL",
+                          ub + db_, (ub + db_) - 100.0, min(ubsz, dbsz), toks, now)
 
-                    # BUY side: asks sum under par
-                    sum_a = ua + da
-                    edge_a = 100.0 - sum_a
-                    ok_a = (edge_a >= PAIR_MIN_EDGE_CENTS and
-                            min(usz, dsz) >= PAIR_MIN_DEPTH)
-                    _episode(asset, tf, open_ts, secs_left, "BUY", sum_a, edge_a,
-                             min(PAIR_SHARES, usz, dsz), ok_a, now)
-
-                    # SELL side: bids sum over par (split $1 and sell both)
-                    sum_b = ub + db_
-                    edge_b = sum_b - 100.0
-                    ok_b = (edge_b >= PAIR_MIN_EDGE_CENTS and
-                            min(ubsz, dbsz) >= PAIR_MIN_DEPTH)
-                    _episode(asset, tf, open_ts, secs_left, "SELL", sum_b, edge_b,
-                             min(PAIR_SHARES, ubsz, dbsz), ok_b, now)
-
-            # close episodes whose windows ended
             for key in list(active.keys()):
                 a, tf, ots, side = key
                 if time.time() > ots + tf * 60:
@@ -254,26 +276,67 @@ def scanner():
             log.error(f"[SCAN] {e}")
 
 
-def _episode(asset, tf, open_ts, secs_left, side, sum_c, edge, pairs, in_cross, now):
+def _reconfirm(toks, side):
+    """Immediate second read of BOTH books. Returns (sum_c, edge, depth) from the
+    fresh read, or None if unreadable. Kills sequential-read phantoms: the two
+    legs of the first read are ~0.1s apart, so a fast book can fake a cross."""
+    up = fetch_book_top(toks[0])
+    dn = fetch_book_top(toks[1])
+    if not up or not dn:
+        return None
+    ua, usz, ub, ubsz = up
+    da, dsz, db_, dbsz = dn
+    if side == "BUY":
+        sc = ua + da
+        return (sc, 100.0 - sc, min(usz, dsz))
+    sc = ub + db_
+    return (sc, sc - 100.0, min(ubsz, dbsz))
+
+
+def _side(asset, tf, open_ts, secs_left, side, sum_c, edge, depth, toks, now):
     key = (asset, tf, open_ts, side)
     ep = active.get(key)
+    in_cross = (edge >= PAIR_MIN_EDGE_CENTS and depth >= PAIR_MIN_DEPTH)
+
     if in_cross and ep is None:
-        locked = round(pairs * edge / 100.0, 4)
+        # CONFIRMATION RE-READ before counting anything
+        rc = _reconfirm(toks, side)
+        if rc is None:
+            return
+        sc2, edge2, depth2 = rc
+        if edge2 < PAIR_MIN_EDGE_CENTS or depth2 < PAIR_MIN_DEPTH:
+            # phantom: crossed on first read, gone on the second. Recorded
+            # (confirmed=0) so the phantom RATE itself is measured; no episode.
+            db_insert_sighting(asset, tf, open_ts, secs_left, side,
+                               round(sum_c, 2), round(edge, 2), 0, 0.0,
+                               depth, confirmed=False)
+            log.info(f"[PAIR] PHANTOM {side} {asset} {tf}m first-read edge "
+                     f"{edge:.1f}¢ vanished on re-read")
+            return
+        pairs = min(PAIR_SHARES, depth2)
+        locked = round(pairs * edge2 / 100.0, 4)
         rid = db_insert_sighting(asset, tf, open_ts, secs_left, side,
-                                 round(sum_c, 2), round(edge, 2), pairs, locked)
-        active[key] = {"rid": rid, "entered": now, "best_edge": edge, "pairs": pairs}
-        log.info(f"[PAIR] {side} {asset} {tf}m sum {sum_c:.1f}¢ edge {edge:.1f}¢ "
-                 f"x{pairs:g} pairs = ${locked:+.2f} locked · {secs_left:.0f}s left")
+                                 round(sc2, 2), round(edge2, 2), pairs, locked,
+                                 depth2, confirmed=True)
+        active[key] = {"rid": rid, "entered": now, "best_edge": edge2, "pairs": pairs}
+        log.info(f"[PAIR] {side} {asset} {tf}m CONFIRMED sum {sc2:.1f}¢ edge "
+                 f"{edge2:.1f}¢ x{pairs:g} (depth {depth2:g}) = ${locked:+.2f} · "
+                 f"{secs_left:.0f}s left")
         if SEND_EACH:
             verb = "buy both" if side == "BUY" else "split &amp; sell both"
             tg(f"💵 <b>PAIR ARB · {ASSET_EMOJI.get(asset,'')}{asset} {tf}m</b>\n"
-               f"{verb}: sum <b>{sum_c:.1f}¢</b> → edge {edge:.1f}¢ × {pairs:g} pairs "
-               f"= <b>${locked:+.2f} locked</b> · {secs_left:.0f}s left")
+               f"{verb}: sum <b>{sc2:.1f}¢</b> → edge {edge2:.1f}¢ × {pairs:g} pairs "
+               f"= <b>${locked:+.2f} locked</b> (re-read ✓, depth {depth2:g}) · "
+               f"{secs_left:.0f}s left")
     elif in_cross and ep is not None:
         if edge > ep["best_edge"]:
-            ep["best_edge"] = edge
-            locked = round(ep["pairs"] * edge / 100.0, 4)
-            db_update_sighting(ep["rid"], edge=round(edge, 2), locked=locked)
+            # an edge SPIKE must also survive a re-read before it becomes the
+            # recorded max (kills phantom 33¢-style outliers in the stats)
+            rc = _reconfirm(toks, side)
+            if rc and rc[1] > ep["best_edge"] and rc[2] >= PAIR_MIN_DEPTH:
+                ep["best_edge"] = rc[1]
+                locked = round(ep["pairs"] * rc[1] / 100.0, 4)
+                db_update_sighting(ep["rid"], edge=round(rc[1], 2), locked=locked)
     elif not in_cross and ep is not None:
         active.pop(key, None)
         db_update_sighting(ep["rid"], duration=round(now - ep["entered"], 1))
