@@ -79,8 +79,33 @@ def resolve_tokens(asset, tf, open_ts, tries=3):
 
 
 # ─── DB (same schema family as the poller census) ────────────────────────────
+DB_EPHEMERAL = False
+
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
+    global DB_PATH, DB_EPHEMERAL
+    d = os.path.dirname(DB_PATH)
+    if d and not os.path.isdir(d):
+        # DB_PATH's directory doesn't exist — the volume is probably mounted
+        # somewhere else. Try to create it (works, but ephemeral if no volume
+        # is behind it) and flag loudly.
+        try:
+            os.makedirs(d, exist_ok=True)
+            DB_EPHEMERAL = True
+            log.error(f"[DB] {d} did not exist — created it, but if your volume "
+                      f"is mounted elsewhere this data will NOT survive "
+                      f"redeploys. Fix: service -> volume -> Mount Path must "
+                      f"match DB_PATH ({d}).")
+        except Exception as e:
+            log.error(f"[DB] cannot create {d}: {e}")
+    try:
+        conn = sqlite3.connect(DB_PATH)
+    except sqlite3.OperationalError:
+        fallback = os.path.basename(DB_PATH) or "pair_ws.db"
+        log.error(f"[DB] cannot open {DB_PATH} — falling back to ./{fallback}. "
+                  f"DATA WILL NOT SURVIVE REDEPLOYS. Check the volume mount path.")
+        DB_PATH = fallback
+        DB_EPHEMERAL = True
+        conn = sqlite3.connect(DB_PATH)
     conn.execute("""CREATE TABLE IF NOT EXISTS sightings (
         id INTEGER PRIMARY KEY AUTOINCREMENT, created TEXT,
         asset TEXT, tf INTEGER, open_ts INTEGER, secs_left REAL,
@@ -390,7 +415,9 @@ def ws_loop():
 def main():
     init_db()
     threading.Thread(target=ws_loop, daemon=True).start()
-    tg(f"⚡ <b>PAIR-ARB WS census live</b> — no money\n"
+    warn = ("\n⚠️ DB is EPHEMERAL — volume mount path doesn't match DB_PATH; "
+            "data resets on redeploy") if DB_EPHEMERAL else ""
+    tg(f"⚡ <b>PAIR-ARB WS census live</b> — no money{warn}\n"
        f"live book feed, ~0.1s detection, measures every cross's LIFETIME\n"
        f"edge ≥{PAIR_MIN_EDGE_CENTS:.1f}¢ · depth ≥{PAIR_MIN_DEPTH:.0f}/side · "
        f"tf={TF}m · tg only ≥{PAIR_TG_MIN_EDGE:.1f}¢\n"
