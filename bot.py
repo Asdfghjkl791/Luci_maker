@@ -1,22 +1,25 @@
 #!/usr/bin/env python3
-# PAIR-ARB WS CENSUS — millisecond-latency sum-under-a-dollar census (no money)
+# LP REWARDS CENSUS — Phase A of the supply-side question (no money)
 #
-# WHY THIS EXISTS
-#   The 3-second REST poller both invented phantoms (sequential reads) and
-#   MISSED every real cross living under ~3s. This version subscribes to
-#   Polymarket's live book websocket for all 14 tokens and maintains local
-#   top-of-book, so crosses are detected in ~0.1s and their LIFETIMES are
-#   measured precisely. The output that decides everything: how many real
-#   crosses/day exist, and the duration histogram — 2s+ crosses are humanly
-#   race-able; sub-0.5s ones belong to colocated bots forever.
+# THE QUESTION
+#   Polymarket's 2026 incentive layer pays makers daily for resting two-sided
+#   limit orders near the midpoint. Pools, qualifying spread, and minimum size
+#   are PUBLIC per market. This census answers, for the 5m/15m crypto markets:
+#     1. Do these markets carry reward pools at all, and how big?
+#     2. How much qualifying liquidity already competes inside the spread?
+#     3. What would a $500-$1000 two-sided quoter's GROSS share be per day —
+#        and does it clear the $1/day/market minimum-payout floor?
 #
-# STILL ZERO MONEY. This is the gate for any live test: if the reachable rate
-# is real, the live executor conversation happens; if not, the edge is closed.
+#   INCOME PIPE ONLY. Deliberately excludes fill toxicity (Phase B's job).
+#   Pre-registered bar: gross >= $5/day at $750 or this door closes finally.
+#
+# FIELD-NAME HEDGE: rewards config field names on the Gamma/CLOB market objects
+#   are read defensively (multiple known spellings) and RAW_DEBUG=true dumps a
+#   full market object once so the parser can be corrected from the wire.
 #
 # ENV (required): TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
-# ENV (optional): DB_PATH, PAIR_MIN_EDGE_CENTS=0.5, PAIR_MIN_DEPTH=5,
-#   PAIR_SHARES=5, PAIR_TG_MIN_EDGE=1.0 (only telegram crosses >= this),
-#   WS_DEBUG=false (log first raw ws messages to verify field names)
+# ENV (optional): DB_PATH, CAPITAL_USD=750, SAMPLE_SECS=60, TIMEFRAMES=5,15,
+#   RAW_DEBUG=false
 
 import os
 import time
@@ -27,123 +30,173 @@ import threading
 import requests
 from datetime import datetime, timezone
 
-import websocket
-
 TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
-DB_PATH          = os.environ.get("DB_PATH", "pair_ws.db")
-PAIR_MIN_EDGE_CENTS = float(os.environ.get("PAIR_MIN_EDGE_CENTS", "0.5"))
-PAIR_MIN_DEPTH      = float(os.environ.get("PAIR_MIN_DEPTH", "5"))
-PAIR_SHARES         = float(os.environ.get("PAIR_SHARES", "5"))
-PAIR_TG_MIN_EDGE    = float(os.environ.get("PAIR_TG_MIN_EDGE", "1.0"))
-WS_DEBUG        = os.environ.get("WS_DEBUG", "false").lower() == "true"
-HEARTBEAT_SECS  = int(os.environ.get("HEARTBEAT_SECS", "300"))
-TF = 5  # 5m windows only in this version
+DB_PATH     = os.environ.get("DB_PATH", "rewards_census.db")
+CAPITAL_USD = float(os.environ.get("CAPITAL_USD", "750"))
+SAMPLE_SECS = float(os.environ.get("SAMPLE_SECS", "60"))
+TFS         = [int(x) for x in os.environ.get("TIMEFRAMES", "5,15").split(",")]
+RAW_DEBUG   = os.environ.get("RAW_DEBUG", "false").lower() == "true"
 
 ASSET_LIST = ["BTC", "ETH", "SOL", "DOGE", "BNB", "XRP", "HYPE"]
-ASSET_EMOJI = {"BTC": "🟠", "ETH": "🔷", "SOL": "🟣", "DOGE": "🟡",
-               "BNB": "🟨", "XRP": "⚪", "HYPE": "🟢"}
 GAMMA_BASE = "https://gamma-api.polymarket.com"
-WS_URL = os.environ.get("WS_URL",
-                        "wss://ws-subscriptions-clob.polymarket.com/ws/market")
+CLOB_BASE  = "https://clob.polymarket.com"
 
 logging.basicConfig(level=logging.INFO,
-                    format="%(asctime)s [%(levelname)s] %(message)s",
-                    handlers=[logging.StreamHandler()])
-log = logging.getLogger("pair-ws")
+                    format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger("rewards-census")
+
+_dumped = {"n": 0}
 
 
-def window_times(tf=TF):
-    now = time.time()
-    length = tf * 60
-    open_ts = int(now // length) * length
-    return open_ts, open_ts + length, open_ts + length - now
+def window_times(tf):
+    now = int(time.time())
+    L = tf * 60
+    o = (now // L) * L
+    return o, o + L, o + L - now
 
 
-def resolve_tokens(asset, tf, open_ts, tries=3):
+def fetch_market(asset, tf, open_ts):
+    """Full market object (tokens + rewards config), defensively parsed."""
     slug = f"{asset.lower()}-updown-{tf}m-{open_ts}"
-    for _ in range(tries):
-        try:
-            r = requests.get(f"{GAMMA_BASE}/events", params={"slug": slug}, timeout=8)
-            arr = r.json()
-            ev = arr[0] if isinstance(arr, list) and arr else arr
-            markets = ev.get("markets", []) if isinstance(ev, dict) else []
-            if markets:
-                toks = json.loads(markets[0].get("clobTokenIds", "[]"))
-                if len(toks) == 2:
-                    return (toks[0], toks[1])
-        except Exception as e:
-            log.debug(f"[RESOLVE] {slug}: {e}")
-        time.sleep(1)
-    return None
+    try:
+        r = requests.get(f"{GAMMA_BASE}/events", params={"slug": slug}, timeout=8)
+        arr = r.json()
+        ev = arr[0] if isinstance(arr, list) and arr else arr
+        markets = ev.get("markets", []) if isinstance(ev, dict) else []
+        if not markets:
+            return None
+        m = markets[0]
+        if RAW_DEBUG and _dumped["n"] < 2:
+            _dumped["n"] += 1
+            log.info(f"[RAW-MARKET] keys={sorted(m.keys())}")
+            log.info(f"[RAW-MARKET] {json.dumps(m)[:1200]}")
+        toks = json.loads(m.get("clobTokenIds", "[]"))
+        if len(toks) != 2:
+            return None
+        # rewards config — multiple known spellings, else None
+        def num(*keys):
+            for k in keys:
+                v = m.get(k)
+                if v not in (None, "", "0", 0):
+                    try:
+                        return float(v)
+                    except Exception:
+                        pass
+            return None
+        min_size  = num("rewardsMinSize", "rewards_min_size", "minIncentiveSize")
+        max_sprd  = num("rewardsMaxSpread", "rewards_max_spread",
+                        "maxIncentiveSpread")
+        pool = None
+        cr = m.get("clobRewards") or m.get("rewards") or []
+        if isinstance(cr, str):
+            try:
+                cr = json.loads(cr)
+            except Exception:
+                cr = []
+        if isinstance(cr, list):
+            for entry in cr:
+                if isinstance(entry, dict):
+                    for k in ("rewardsDailyRate", "rewards_daily_rate",
+                              "dailyRate", "rewardsAmount"):
+                        v = entry.get(k)
+                        if v:
+                            try:
+                                pool = (pool or 0) + float(v)
+                            except Exception:
+                                pass
+        return {"tokens": toks, "min_size": min_size,
+                "max_spread": max_sprd, "pool": pool}
+    except Exception as e:
+        log.debug(f"[MKT] {slug}: {e}")
+        return None
 
 
-# ─── DB (same schema family as the poller census) ────────────────────────────
-DB_EPHEMERAL = False
+def fetch_book(token_id):
+    try:
+        r = requests.get(f"{CLOB_BASE}/book", params={"token_id": token_id},
+                         timeout=6)
+        b = r.json()
+        bids = [(float(x["price"]), float(x.get("size", 0)))
+                for x in b.get("bids", []) if float(x.get("size", 0)) > 0]
+        asks = [(float(x["price"]), float(x.get("size", 0)))
+                for x in b.get("asks", []) if float(x.get("size", 0)) > 0]
+        return bids, asks
+    except Exception:
+        return None
+
+
+def qscore(spread, max_spread, size):
+    """Polymarket's published per-order score: ((S - s)/S)^2 * size."""
+    if max_spread is None or max_spread <= 0 or spread > max_spread:
+        return 0.0
+    return ((max_spread - spread) / max_spread) ** 2 * size
+
+
+def sample_market(asset, tf, mk):
+    """One census sample: competing score vs our hypothetical score -> share."""
+    up = fetch_book(mk["tokens"][0])
+    if not up:
+        return None
+    bids, asks = up
+    if not bids or not asks:
+        return None
+    mid = (max(p for p, _ in bids) + min(p for p, _ in asks)) / 2.0
+    ms = mk["max_spread"]
+    if ms is None:
+        # market carries NO rewards config — record that as a real finding
+        # (pool 0), so "no pools exist" is distinguishable from "sampler dead"
+        return {"pool": 0.0, "share": 0.0, "min_ok": False,
+                "comp_bid_sz": sum(sz for _, sz in bids),
+                "comp_ask_sz": sum(sz for _, sz in asks)}
+    ms_frac = ms / 100.0 if ms > 1 else ms   # cents vs fraction, defensively
+    # competing qualifying score, each side (UP token book == both sides of mkt)
+    comp_bid = sum(qscore(abs(mid - p), ms_frac, sz) for p, sz in bids)
+    comp_ask = sum(qscore(abs(p - mid), ms_frac, sz) for p, sz in asks)
+    # two-sided min rule (single-sided allowed at /c=3 only if mid in [.1,.9])
+    if 0.10 <= mid <= 0.90:
+        comp = max(min(comp_bid, comp_ask), max(comp_bid, comp_ask) / 3.0)
+    else:
+        comp = min(comp_bid, comp_ask)
+    # OUR hypothetical quote: both sides at the inside (spread ≈ half the
+    # bid-ask), sized by capital split across markets
+    n_mk = max(1, len(TFS) * len(ASSET_LIST))
+    cap_here = CAPITAL_USD / n_mk
+    our_shares = (cap_here / 2.0) / max(mid, 0.02)   # per side
+    min_ok = (mk["min_size"] is None) or (our_shares >= mk["min_size"])
+    inside = abs(min(p for p, _ in asks) - mid)
+    ours = qscore(inside, ms_frac, our_shares)
+    if 0.10 <= mid <= 0.90:
+        our_q = ours          # two-sided symmetric
+    else:
+        our_q = ours          # must be two-sided anyway; same size both sides
+    share = our_q / (comp + our_q) if (comp + our_q) > 0 else 0.0
+    return {"pool": mk["pool"] or 0.0, "share": share, "min_ok": min_ok,
+            "comp_bid_sz": sum(sz for _, sz in bids),
+            "comp_ask_sz": sum(sz for _, sz in asks)}
+
 
 def init_db():
-    global DB_PATH, DB_EPHEMERAL
-    d = os.path.dirname(DB_PATH)
-    if d and not os.path.isdir(d):
-        # DB_PATH's directory doesn't exist — the volume is probably mounted
-        # somewhere else. Try to create it (works, but ephemeral if no volume
-        # is behind it) and flag loudly.
-        try:
-            os.makedirs(d, exist_ok=True)
-            DB_EPHEMERAL = True
-            log.error(f"[DB] {d} did not exist — created it, but if your volume "
-                      f"is mounted elsewhere this data will NOT survive "
-                      f"redeploys. Fix: service -> volume -> Mount Path must "
-                      f"match DB_PATH ({d}).")
-        except Exception as e:
-            log.error(f"[DB] cannot create {d}: {e}")
-    try:
-        conn = sqlite3.connect(DB_PATH)
-    except sqlite3.OperationalError:
-        fallback = os.path.basename(DB_PATH) or "pair_ws.db"
-        log.error(f"[DB] cannot open {DB_PATH} — falling back to ./{fallback}. "
-                  f"DATA WILL NOT SURVIVE REDEPLOYS. Check the volume mount path.")
-        DB_PATH = fallback
-        DB_EPHEMERAL = True
-        conn = sqlite3.connect(DB_PATH)
-    conn.execute("""CREATE TABLE IF NOT EXISTS sightings (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, created TEXT,
-        asset TEXT, tf INTEGER, open_ts INTEGER, secs_left REAL,
-        side TEXT, sum_cents REAL, edge_cents REAL,
-        pairs REAL, locked_usd REAL, duration_secs REAL,
-        depth_avail REAL, confirmed INTEGER DEFAULT 1)""")
-    conn.commit()
-    conn.close()
-
-
-def db_insert(asset, secs_left, side, sum_c, edge, pairs, locked, depth):
     conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("""INSERT INTO sightings (created,asset,tf,open_ts,secs_left,side,
-                 sum_cents,edge_cents,pairs,locked_usd,duration_secs,depth_avail,
-                 confirmed) VALUES (?,?,?,?,?,?,?,?,?,?,NULL,?,1)""",
-              (datetime.now(timezone.utc).isoformat(), asset, TF,
-               int(window_times()[0]), secs_left, side, sum_c, edge, pairs,
-               locked, depth))
-    rid = c.lastrowid
+    conn.execute("""CREATE TABLE IF NOT EXISTS samples (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, created TEXT, asset TEXT,
+        tf INTEGER, pool REAL, share REAL, min_ok INTEGER,
+        depth_bid REAL, depth_ask REAL)""")
     conn.commit()
     conn.close()
-    return rid
 
 
-def db_update(rid, edge=None, locked=None, duration=None):
+def db_add(asset, tf, s):
     conn = sqlite3.connect(DB_PATH)
-    if edge is not None:
-        conn.execute("UPDATE sightings SET edge_cents=?, locked_usd=? WHERE id=?",
-                     (edge, locked, rid))
-    if duration is not None:
-        conn.execute("UPDATE sightings SET duration_secs=? WHERE id=?",
-                     (duration, rid))
+    conn.execute("INSERT INTO samples (created,asset,tf,pool,share,min_ok,"
+                 "depth_bid,depth_ask) VALUES (?,?,?,?,?,?,?,?)",
+                 (datetime.now(timezone.utc).isoformat(), asset, tf,
+                  s["pool"], s["share"], 1 if s["min_ok"] else 0,
+                  s["comp_bid_sz"], s["comp_ask_sz"]))
     conn.commit()
     conn.close()
 
 
-# ─── TELEGRAM ────────────────────────────────────────────────────────────────
 def tg(msg):
     try:
         r = requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
@@ -154,7 +207,7 @@ def tg(msg):
         except Exception:
             body = {}
         if getattr(r, "status_code", 200) != 200 or not body.get("ok", False):
-            log.error(f"[TG] REJECTED {getattr(r, 'status_code', '?')}: "
+            log.error(f"[TG] REJECTED {getattr(r,'status_code','?')}: "
                       f"{str(body)[:160]}")
             return
         log.info(f"[TG] {msg[:80]}")
@@ -179,257 +232,81 @@ def handle_commands():
             if t == "/stats":
                 conn = sqlite3.connect(DB_PATH)
                 c = conn.cursor()
-                c.execute("SELECT side, edge_cents, locked_usd, duration_secs, "
-                          "asset, depth_avail, secs_left FROM sightings")
+                c.execute("SELECT asset, tf, pool, share, min_ok FROM samples")
                 rows = c.fetchall()
                 conn.close()
                 if not rows:
-                    tg("⚡ <b>PAIR-ARB WS census</b>\nno crosses yet — books tight "
-                       "at millisecond resolution too")
+                    tg("💰 <b>REWARDS census</b>\nno samples yet")
                     continue
-                def sec(side):
-                    sub = [r for r in rows if r[0] == side]
-                    if not sub:
-                        return f"{side}: none"
-                    n = len(sub)
-                    avg_e = sum(r[1] for r in sub) / n
-                    mx_e = max(r[1] for r in sub)
-                    tot = sum(r[2] or 0 for r in sub)
-                    return (f"{side}: {n} · edge avg {avg_e:.1f}¢ max {mx_e:.1f}¢ "
-                            f"· ${tot:+.2f}")
-                durs = [r[3] for r in rows if r[3] is not None]
-                d_sub05 = sum(1 for d in durs if d < 0.5)
-                d_05_2 = sum(1 for d in durs if 0.5 <= d < 2)
-                d_2_10 = sum(1 for d in durs if 2 <= d < 10)
-                d_10p = sum(1 for d in durs if d >= 10)
-                assets = {}
-                for r in rows:
-                    assets.setdefault(r[4], [0, 0.0])
-                    assets[r[4]][0] += 1
-                    assets[r[4]][1] += (r[2] or 0)
-                top = sorted(assets.items(), key=lambda kv: -kv[1][1])[:4]
-                alines = " · ".join(f"{a} {n}x ${v:+.2f}" for a, (n, v) in top)
-                reach = d_2_10 + d_10p
-                tg("⚡ <b>PAIR-ARB WS census</b> (live book feed)\n"
-                   + sec("BUY") + "\n" + sec("SELL") + "\n"
-                   f"lifetimes: &lt;0.5s: {d_sub05} · 0.5-2s: {d_05_2} · "
-                   f"2-10s: {d_2_10} · 10s+: {d_10p}\n"
-                   f"<b>race-able (2s+): {reach}</b>\n"
-                   f"top: {alines}")
+                pools = [r[2] for r in rows if r[2]]
+                if not pools:
+                    tg("💰 <b>REWARDS census</b>\n"
+                       f"{len(rows)} samples · <b>NO reward pools found on these "
+                       f"markets</b>\nIf this holds for 24h, the crypto updown "
+                       f"markets carry no LP pools and Phase A fails on "
+                       f"question 1.")
+                    continue
+                per = {}
+                for a, tf, pool, share, mok in rows:
+                    k = f"{a} {tf}m"
+                    per.setdefault(k, []).append((pool or 0, share, mok))
+                lines = []
+                total = 0.0
+                for k, v in sorted(per.items()):
+                    ap = sum(x[0] for x in v) / len(v)
+                    ash = sum(x[1] for x in v) / len(v)
+                    mokr = sum(x[2] for x in v) / len(v)
+                    g = ap * ash
+                    floor = "" if g >= 1.0 else " &lt;$1 floor ⚠️"
+                    minw = "" if mokr > 0.5 else " size&lt;min ❌"
+                    if g >= 1.0 and mokr > 0.5:
+                        total += g
+                    lines.append(f"{k}: pool ~${ap:.0f}/d · share {ash*100:.2f}% "
+                                 f"→ ${g:.2f}/d{floor}{minw}")
+                verdict = ("✅ ABOVE the $5/day bar" if total >= 5
+                           else "⚠️ below the $5/day bar")
+                tg(f"💰 <b>REWARDS census</b> @ ${CAPITAL_USD:.0f}\n"
+                   + "\n".join(lines[:14]) +
+                   f"\n<b>payable gross ≈ ${total:.2f}/day</b> "
+                   f"(after $1 floors + min-size gates)\n{verdict}")
     except Exception:
         pass
 
 
-# ─── LOCAL BOOKS ─────────────────────────────────────────────────────────────
-books = {}          # token -> {"bids": {price: size}, "asks": {price: size}}
-token_asset = {}    # token -> (asset, "up"/"down")
-pair_tokens = {}    # asset -> (up_token, down_token)
-active = {}         # (asset, side) -> {rid, entered, best_edge, pairs}
-stats_events = {"n": 0}
-
-
-def _levels(msg, *names):
-    for n in names:
-        if n in msg and isinstance(msg[n], list):
-            return msg[n]
-    return []
-
-
-def apply_book(tok, msg):
-    """Full snapshot. Handles both bids/asks and buys/sells field spellings."""
-    b = {}
-    a = {}
-    for lv in _levels(msg, "bids", "buys"):
-        p, sz = float(lv.get("price", 0)), float(lv.get("size", 0))
-        if p > 0 and sz > 0:
-            b[p] = sz
-    for lv in _levels(msg, "asks", "sells"):
-        p, sz = float(lv.get("price", 0)), float(lv.get("size", 0))
-        if p > 0 and sz > 0:
-            a[p] = sz
-    books[tok] = {"bids": b, "asks": a}
-
-
-def apply_change(tok, msg):
-    bk = books.get(tok)
-    if bk is None:
-        return
-    for ch in msg.get("changes", []):
-        try:
-            p = float(ch.get("price", 0))
-            sz = float(ch.get("size", 0))
-            side = ch.get("side", "").upper()
-        except Exception:
-            continue
-        d = bk["bids"] if side == "BUY" else bk["asks"]
-        if sz <= 0:
-            d.pop(p, None)
-        else:
-            d[p] = sz
-
-
-def top_of_book(tok):
-    bk = books.get(tok)
-    if not bk or not bk["asks"] or not bk["bids"]:
-        return None
-    ap = min(bk["asks"])
-    bp = max(bk["bids"])
-    return (ap * 100.0, bk["asks"][ap], bp * 100.0, bk["bids"][bp])
-
-
-def check_pair(asset):
-    toks = pair_tokens.get(asset)
-    if not toks:
-        return
-    up = top_of_book(toks[0])
-    dn = top_of_book(toks[1])
-    if not up or not dn:
-        return
-    now = time.time()
-    _, close_ts, secs_left = window_times()
-    ua, usz, ub, ubsz = up
-    da, dsz, db_, dbsz = dn
-    _side(asset, "BUY", ua + da, 100.0 - (ua + da), min(usz, dsz), secs_left, now)
-    _side(asset, "SELL", ub + db_, (ub + db_) - 100.0, min(ubsz, dbsz), secs_left, now)
-
-
-def _side(asset, side, sum_c, edge, depth, secs_left, now):
-    key = (asset, side)
-    ep = active.get(key)
-    in_cross = (edge >= PAIR_MIN_EDGE_CENTS and depth >= PAIR_MIN_DEPTH)
-    if in_cross and ep is None:
-        pairs = min(PAIR_SHARES, depth)
-        locked = round(pairs * edge / 100.0, 4)
-        rid = db_insert(asset, round(secs_left, 1), side, round(sum_c, 2),
-                        round(edge, 2), pairs, locked, depth)
-        active[key] = {"rid": rid, "entered": now, "best_edge": edge,
-                       "pairs": pairs}
-        log.info(f"[WS-PAIR] {side} {asset} sum {sum_c:.1f}¢ edge {edge:.1f}¢ "
-                 f"depth {depth:g} · {secs_left:.0f}s left")
-        if edge >= PAIR_TG_MIN_EDGE:
-            verb = "buy both" if side == "BUY" else "split &amp; sell both"
-            tg(f"⚡ <b>WS PAIR · {ASSET_EMOJI.get(asset,'')}{asset}</b> {verb}: "
-               f"sum <b>{sum_c:.1f}¢</b> edge {edge:.1f}¢ · depth {depth:g} · "
-               f"{secs_left:.0f}s left")
-    elif in_cross and ep is not None:
-        if edge > ep["best_edge"]:
-            ep["best_edge"] = edge
-            locked = round(ep["pairs"] * edge / 100.0, 4)
-            db_update(ep["rid"], edge=round(edge, 2), locked=locked)
-    elif not in_cross and ep is not None:
-        active.pop(key, None)
-        dur = round(now - ep["entered"], 3)
-        db_update(ep["rid"], duration=dur)
-        log.info(f"[WS-PAIR] {side} {asset} closed after {dur:.2f}s "
-                 f"(best {ep['best_edge']:.1f}¢)")
-
-
-def close_all(now):
-    for key in list(active.keys()):
-        ep = active.pop(key)
-        db_update(ep["rid"], duration=round(now - ep["entered"], 3))
-
-
-# ─── WS LOOP: one connection per 5-minute window generation ─────────────────
-def ws_loop():
+def sampler():
     while True:
         try:
-            open_ts, close_ts, secs_left = window_times()
-            if secs_left < 3:
-                time.sleep(secs_left + 0.5)
-                continue
-            # resolve this window's 14 tokens
-            books.clear()
-            token_asset.clear()
-            pair_tokens.clear()
-            all_toks = []
-            for a in ASSET_LIST:
-                toks = resolve_tokens(a, TF, int(open_ts))
-                if not toks:
-                    log.warning(f"[WS] no market for {a} this window")
+            for tf in TFS:
+                open_ts, close_ts, secs_left = window_times(tf)
+                if secs_left < 20:
                     continue
-                pair_tokens[a] = toks
-                token_asset[toks[0]] = (a, "up")
-                token_asset[toks[1]] = (a, "down")
-                all_toks += [toks[0], toks[1]]
-            if not all_toks:
-                time.sleep(5)
-                continue
-            ws = websocket.create_connection(WS_URL, timeout=10)
-            ws.settimeout(5)
-            ws.send(json.dumps({"type": "market", "assets_ids": all_toks,
-                                "asset_ids": all_toks}))
-            log.info(f"[WS] subscribed {len(all_toks)} tokens · window "
-                     f"{int(secs_left)}s remaining")
-            dbg = 0
-            last_ping = time.time()
-            while time.time() < close_ts - 0.3:
-                if time.time() - last_ping > 10:
-                    try:
-                        ws.send("PING")
-                    except Exception:
-                        break
-                    last_ping = time.time()
-                try:
-                    raw = ws.recv()
-                except websocket.WebSocketTimeoutException:
-                    continue
-                if not raw or raw == "PONG":
-                    continue
-                if WS_DEBUG and dbg < 5:
-                    dbg += 1
-                    log.info(f"[WS-RAW] {str(raw)[:300]}")
-                try:
-                    data = json.loads(raw)
-                except Exception:
-                    continue
-                events = data if isinstance(data, list) else [data]
-                touched = set()
-                for ev in events:
-                    if not isinstance(ev, dict):
+                for asset in ASSET_LIST:
+                    mk = fetch_market(asset, tf, open_ts)
+                    if not mk:
                         continue
-                    et = ev.get("event_type", ev.get("type", ""))
-                    tok = ev.get("asset_id", ev.get("assetId", ""))
-                    if tok not in token_asset:
-                        continue
-                    if et == "book":
-                        apply_book(tok, ev)
-                        touched.add(token_asset[tok][0])
-                    elif et == "price_change":
-                        apply_change(tok, ev)
-                        touched.add(token_asset[tok][0])
-                    stats_events["n"] += 1
-                for a in touched:
-                    check_pair(a)
-            close_all(time.time())
-            try:
-                ws.close()
-            except Exception:
-                pass
+                    s = sample_market(asset, tf, mk)
+                    if s:
+                        db_add(asset, tf, s)
+                        if s["pool"]:
+                            log.info(f"[SAMPLE] {asset} {tf}m pool ${s['pool']:.0f}/d "
+                                     f"share {s['share']*100:.2f}% min_ok={s['min_ok']}")
+                        else:
+                            log.info(f"[SAMPLE] {asset} {tf}m NO POOL")
         except Exception as e:
-            log.error(f"[WS] {e} — reconnecting")
-            close_all(time.time())
-            time.sleep(3)
+            log.error(f"[SAMPLER] {e}")
+        time.sleep(SAMPLE_SECS)
 
 
 def main():
     init_db()
-    threading.Thread(target=ws_loop, daemon=True).start()
-    warn = ("\n⚠️ DB is EPHEMERAL — volume mount path doesn't match DB_PATH; "
-            "data resets on redeploy") if DB_EPHEMERAL else ""
-    tg(f"⚡ <b>PAIR-ARB WS census live</b> — no money{warn}\n"
-       f"live book feed, ~0.1s detection, measures every cross's LIFETIME\n"
-       f"edge ≥{PAIR_MIN_EDGE_CENTS:.1f}¢ · depth ≥{PAIR_MIN_DEPTH:.0f}/side · "
-       f"tf={TF}m · tg only ≥{PAIR_TG_MIN_EDGE:.1f}¢\n"
-       f"the number that gates a live test: crosses living 2s+\n/stats")
-    hb = 0
+    threading.Thread(target=sampler, daemon=True).start()
+    tg(f"💰 <b>LP REWARDS CENSUS live</b> — no money, Phase A\n"
+       f"question 1: do the crypto updown markets carry reward pools?\n"
+       f"question 2: what would ${CAPITAL_USD:.0f} two-sided earn GROSS/day?\n"
+       f"pre-registered bar: ≥$5/day payable gross, else this closes\n/stats")
     while True:
         try:
             handle_commands()
-            if HEARTBEAT_SECS and time.time() - hb >= HEARTBEAT_SECS:
-                hb = time.time()
-                log.info(f"[Heartbeat] ws events={stats_events['n']} "
-                         f"open episodes={len(active)}")
         except Exception as e:
             log.error(f"main: {e}")
         time.sleep(1)
