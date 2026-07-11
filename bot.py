@@ -55,19 +55,24 @@ def _clob_rewards(condition_id):
     not on the Gamma object (verified from a live RAW-MARKET dump). Cached."""
     if condition_id in _rw_cache:
         return _rw_cache[condition_id]
-    rw = None
     try:
         r = requests.get(f"{CLOB_BASE}/markets/{condition_id}", timeout=8)
+        if getattr(r, "status_code", 200) != 200:
+            log.warning(f"[CLOB-RW] HTTP {r.status_code} for "
+                        f"{str(condition_id)[:14]} — will retry")
+            return None                     # do NOT cache failures
         j = r.json()
         rw = j.get("rewards") if isinstance(j, dict) else None
         if RAW_DEBUG and _dumped["n"] < 6:
             _dumped["n"] += 1
             log.info(f"[RAW-CLOB-REWARDS] {json.dumps(rw)[:400]}")
     except Exception as e:
-        log.debug(f"[CLOB-RW] {str(condition_id)[:12]}: {e}")
+        log.warning(f"[CLOB-RW] fetch failed {str(condition_id)[:14]}: {e} — "
+                    f"will retry")
+        return None                         # do NOT cache failures
     if len(_rw_cache) > 4000:
         _rw_cache.clear()
-    _rw_cache[condition_id] = rw
+    _rw_cache[condition_id] = rw            # cache only a real read (even None)
     return rw
 
 
@@ -326,8 +331,52 @@ def sampler():
         time.sleep(SAMPLE_SECS)
 
 
+def sampling_probe():
+    """DEFINITIVE question-1 check: /sampling-markets lists ONLY markets in the
+    liquidity-rewards program. Zero updowns in that list = no pools on these
+    markets, certified platform-side in one probe."""
+    total, updown, examples, cursor = 0, 0, [], ""
+    try:
+        for _ in range(40):
+            r = requests.get(f"{CLOB_BASE}/sampling-markets",
+                             params=({"next_cursor": cursor} if cursor else {}),
+                             timeout=10)
+            j = r.json()
+            data = j.get("data") or []
+            for mm in data:
+                if not isinstance(mm, dict):
+                    continue
+                total += 1
+                slug = str(mm.get("market_slug") or mm.get("slug") or "").lower()
+                q = str(mm.get("question") or "").lower()
+                if "updown" in slug or "up or down" in q:
+                    updown += 1
+                    if len(examples) < 3:
+                        examples.append(slug or q[:44])
+            cursor = j.get("next_cursor") or ""
+            if not cursor or cursor == "LTE=":
+                break
+    except Exception as e:
+        log.warning(f"[PROBE] sampling-markets failed: {e}")
+        return None
+    return total, updown, examples
+
+
 def main():
     init_db()
+    probe = sampling_probe()
+    if probe:
+        total, updown, ex = probe
+        if updown > 0:
+            tg(f"🔎 <b>Rewards-program probe</b>: {total} markets enrolled, "
+               f"<b>{updown} are crypto updown</b> (e.g. {', '.join(ex)})\n"
+               f"→ pools EXIST on these markets — census measures your share")
+        else:
+            tg(f"🔎 <b>Rewards-program probe</b>: {total} markets enrolled, "
+               f"<b>ZERO are crypto updown</b>\n"
+               f"→ question 1 answered at the source: no LP pools on the "
+               f"updown markets. Phase A fails on question 1.")
+        log.info(f"[PROBE] enrolled={total} updown={updown} {ex}")
     threading.Thread(target=sampler, daemon=True).start()
     tg(f"💰 <b>LP REWARDS CENSUS live</b> — no money, Phase A\n"
        f"question 1: do the crypto updown markets carry reward pools?\n"
