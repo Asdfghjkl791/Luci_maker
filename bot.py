@@ -47,6 +47,28 @@ logging.basicConfig(level=logging.INFO,
 log = logging.getLogger("rewards-census")
 
 _dumped = {"n": 0}
+_rw_cache = {}
+
+
+def _clob_rewards(condition_id):
+    """Rewards object from the CLOB market endpoint — the daily pool lives HERE,
+    not on the Gamma object (verified from a live RAW-MARKET dump). Cached."""
+    if condition_id in _rw_cache:
+        return _rw_cache[condition_id]
+    rw = None
+    try:
+        r = requests.get(f"{CLOB_BASE}/markets/{condition_id}", timeout=8)
+        j = r.json()
+        rw = j.get("rewards") if isinstance(j, dict) else None
+        if RAW_DEBUG and _dumped["n"] < 6:
+            _dumped["n"] += 1
+            log.info(f"[RAW-CLOB-REWARDS] {json.dumps(rw)[:400]}")
+    except Exception as e:
+        log.debug(f"[CLOB-RW] {str(condition_id)[:12]}: {e}")
+    if len(_rw_cache) > 4000:
+        _rw_cache.clear()
+    _rw_cache[condition_id] = rw
+    return rw
 
 
 def window_times(tf):
@@ -87,24 +109,31 @@ def fetch_market(asset, tf, open_ts):
         min_size  = num("rewardsMinSize", "rewards_min_size", "minIncentiveSize")
         max_sprd  = num("rewardsMaxSpread", "rewards_max_spread",
                         "maxIncentiveSpread")
+        # Daily pool comes from the CLOB market endpoint (rewards.rates[]);
+        # the Gamma object has no rewards-amount key at all.
         pool = None
-        cr = m.get("clobRewards") or m.get("rewards") or []
-        if isinstance(cr, str):
-            try:
-                cr = json.loads(cr)
-            except Exception:
-                cr = []
-        if isinstance(cr, list):
-            for entry in cr:
-                if isinstance(entry, dict):
-                    for k in ("rewardsDailyRate", "rewards_daily_rate",
-                              "dailyRate", "rewardsAmount"):
-                        v = entry.get(k)
+        cid = m.get("conditionId") or m.get("condition_id")
+        if cid:
+            rw = _clob_rewards(cid)
+            if rw:
+                for entry in (rw.get("rates") or []):
+                    if isinstance(entry, dict):
+                        v = (entry.get("rewards_daily_rate")
+                             or entry.get("rewardsDailyRate"))
                         if v:
                             try:
                                 pool = (pool or 0) + float(v)
                             except Exception:
                                 pass
+                for k, cur in (("min_size", min_size), ("max_spread", max_sprd)):
+                    if cur is None and rw.get(k) not in (None, ""):
+                        try:
+                            if k == "min_size":
+                                min_size = float(rw[k])
+                            else:
+                                max_sprd = float(rw[k])
+                        except Exception:
+                            pass
         return {"tokens": toks, "min_size": min_size,
                 "max_spread": max_sprd, "pool": pool}
     except Exception as e:
