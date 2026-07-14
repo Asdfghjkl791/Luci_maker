@@ -56,6 +56,10 @@ EXCLUDE_ASSETS   = set(x.strip().upper() for x in
                        os.environ.get("EXCLUDE_ASSETS", "XRP").split(",") if x.strip())
 EXIT_TRIGGER_CENTS = float(os.environ.get("EXIT_TRIGGER_CENTS", "0"))  # 0 = no exit
 EXIT_FLOOR_CENTS = float(os.environ.get("EXIT_FLOOR_CENTS", "50"))  # don't sell below this (gapped)
+# SPOT-REVERSAL exit: sell when the UNDERLYING price crosses back against the
+# bet by this margin past the window open — ignores noisy bid wobbles.
+EXIT_SPOT_ENABLED = os.environ.get("EXIT_SPOT_ENABLED", "false").lower() == "true"
+EXIT_SPOT_MARGIN_PCT = float(os.environ.get("EXIT_SPOT_MARGIN_PCT", "0.02"))
 _clob = None
 _live_realized = 0.0
 try:
@@ -403,35 +407,46 @@ def monitor():
                     continue
                 s.setdefault("bid_path", []).append(
                     [round(s["close_ts"] - now, 1), round(bid, 1)])
-                # LIVE exit: sell a failing position when its bid crosses the
-                # trigger — but only within a BAND. Below EXIT_FLOOR the bid has
-                # already gapped (selling there locks in a near-total loss), so
-                # hold to settlement instead. This cuts SMALL losses early
-                # without panic-dumping craters.
-                if (LIVE and EXIT_TRIGGER_CENTS > 0 and not s.get("exited")
-                        and EXIT_FLOOR_CENTS <= bid <= EXIT_TRIGGER_CENTS):
-                    shares = LIVE_STAKE / (s["ask"] / 100.0)
-                    if live_sell(s["token"], round(shares, 2), bid):
-                        s["exited"] = True
-                        s["exit_price"] = bid   # record ACTUAL sell price
-                        # exited positions are DONE — resolve now at the real
-                        # sell price, don't wait for settlement (you're out).
-                        exit_pnl = shares * (bid / 100.0) - LIVE_STAKE
-                        global _live_realized
-                        _live_realized += exit_pnl
-                        db_resolve(s["rid"], bid / 100.0, "EXIT", round(exit_pnl, 4))
-                        with pending_lock:
-                            s in pending and pending.remove(s)
-                        tg(f"🔴 <b>LIVE EXIT {ASSET_EMOJI.get(s['asset'],'')}"
-                           f"{s['asset']} {s['tf']}m</b> sold @{bid:.1f}¢ "
-                           f"(was {s['ask']:.0f}¢) · <b>${exit_pnl:+.2f}</b>")
-                    else:
-                        log.warning(f"[EXIT] sell failed {s['asset']} @{bid:.1f}¢")
-                elif (LIVE and EXIT_TRIGGER_CENTS > 0 and not s.get("exited")
-                      and bid < EXIT_FLOOR_CENTS):
-                    log.info(f"[EXIT] {s['asset']} bid {bid:.1f}¢ already below "
-                             f"floor {EXIT_FLOOR_CENTS:.0f}¢ — holding to settle "
-                             f"(gapped, selling would lock max loss)")
+                # SPOT-REVERSAL exit: sell ONLY when the underlying price has
+                # actually turned against the bet — i.e. crossed back past the
+                # window's open price by more than EXIT_SPOT_MARGIN_PCT. Normal
+                # bid wobbles on a winning position DON'T trigger this, because
+                # we check the real price, not the noisy bid. This is what stops
+                # the exit from selling good positions on temporary dips.
+                if (LIVE and EXIT_SPOT_ENABLED and not s.get("exited")):
+                    cur = prices_ref.get(s["asset"])
+                    op = s.get("open_price")
+                    if cur is not None and op:
+                        move_now = (cur - op) / op * 100.0  # + = UP side winning
+                        # position is losing if price moved against its direction
+                        adverse = (-move_now if s["direction"] == "UP" else move_now)
+                        # adverse > margin means the underlying has genuinely
+                        # crossed against us — a real reversal, not a bid wobble
+                        if adverse >= EXIT_SPOT_MARGIN_PCT:
+                            # only sell if the bid is still in a sane band (not a
+                            # gapped crater where selling locks max loss)
+                            if bid >= EXIT_FLOOR_CENTS:
+                                shares = LIVE_STAKE / (s["ask"] / 100.0)
+                                if live_sell(s["token"], round(shares, 2), bid):
+                                    s["exited"] = True
+                                    s["exit_price"] = bid
+                                    exit_pnl = shares * (bid / 100.0) - LIVE_STAKE
+                                    global _live_realized
+                                    _live_realized += exit_pnl
+                                    db_resolve(s["rid"], bid / 100.0, "EXIT",
+                                               round(exit_pnl, 4))
+                                    with pending_lock:
+                                        s in pending and pending.remove(s)
+                                    tg(f"🔴 <b>LIVE EXIT {ASSET_EMOJI.get(s['asset'],'')}"
+                                       f"{s['asset']} {s['tf']}m</b> sold @{bid:.1f}¢ "
+                                       f"· spot reversed {adverse:+.3f}% vs open "
+                                       f"· <b>${exit_pnl:+.2f}</b>")
+                                else:
+                                    log.warning(f"[EXIT] sell failed {s['asset']} @{bid:.1f}¢")
+                            else:
+                                log.info(f"[EXIT] {s['asset']} spot reversed "
+                                         f"{adverse:+.3f}% but bid {bid:.1f}¢ below "
+                                         f"floor {EXIT_FLOOR_CENTS:.0f}¢ — holding")
         except Exception as e:
             log.error(f"[MONITOR] {e}")
 
